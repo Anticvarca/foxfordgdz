@@ -1,23 +1,29 @@
 import base64
 import os
+import httpx
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 
-# --- Читаем переменные окружения, заданные в BotHost ---
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
 
 if not GIGACHAT_CREDENTIALS:
     raise SystemExit("Переменная GIGACHAT_CREDENTIALS не задана в панели BotHost!")
 
-# Создаём клиент GigaChat
-# verify_ssl_certs=False нужен, если у вас нет сертификатов Минцифры.
-# Для продакшена лучше настроить сертификаты, но для теста это сработает.
+
+# --- Обход httpx 0.28+ (параметр 'proxies') ---
+class CustomAsyncHTTPClient(httpx.AsyncClient):
+    def __init__(self, *args, **kwargs):
+        kwargs.pop("proxies", None)
+        super().__init__(*args, **kwargs)
+
+
 client = GigaChat(
     credentials=GIGACHAT_CREDENTIALS,
     scope=GIGACHAT_SCOPE,
     verify_ssl_certs=False,
-    model="GigaChat",  # Базовая модель. Можно заменить на GigaChat-Pro для лучшего качества.
+    model="GigaChat",
+    http_client=CustomAsyncHTTPClient(),
 )
 
 SYSTEM_PROMPT = """Ты — умный помощник. Пользователь взрослый, ему нужен готовый ответ.
