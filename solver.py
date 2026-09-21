@@ -1,5 +1,5 @@
 import asyncio
-import base64
+import io
 import os
 import logging
 from gigachat import GigaChat
@@ -17,19 +17,18 @@ if not GIGACHAT_CREDENTIALS:
 else:
     log.info("GIGACHAT_CREDENTIALS получен, длина %d", len(GIGACHAT_CREDENTIALS))
 
+# ВАЖНО: для Vision нужна Pro или Max. Если Pro недоступен — упадёт.
 client = GigaChat(
     credentials=GIGACHAT_CREDENTIALS or "dummy",
     scope=GIGACHAT_SCOPE,
     verify_ssl_certs=False,
-    model="GigaChat",
+    model="GigaChat-Pro",
 )
 
-# --- Защита от одновременных запросов и 429 ---
 _giga_lock = asyncio.Lock()
 
 
-async def _request_with_retry(payload: Chat, max_attempts: int = 3) -> str:
-    """Отправляет запрос в GigaChat с ретраями при 429."""
+async def _call_with_retry(payload: Chat, max_attempts: int = 3) -> str:
     async with _giga_lock:
         last_error = None
         for attempt in range(1, max_attempts + 1):
@@ -41,7 +40,7 @@ async def _request_with_retry(payload: Chat, max_attempts: int = 3) -> str:
                 last_error = e
                 if status == 429:
                     wait = 1.5 * attempt
-                    log.warning("429 от GigaChat, ждём %.1fs и повторяем (%d/%d)",
+                    log.warning("429 от GigaChat, ждём %.1fs (%d/%d)",
                                 wait, attempt, max_attempts)
                     await asyncio.sleep(wait)
                     continue
@@ -74,21 +73,37 @@ async def solve_text(question: str, subject: str = "general") -> str:
         ],
         temperature=0.2,
     )
-    return await _request_with_retry(payload)
+    return await _call_with_retry(payload)
 
 
 async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "general") -> str:
+    # 1. Загружаем файл в GigaChat, получаем его id
+    try:
+        uploaded = await client.aupload_file(
+            ("image.jpg", io.BytesIO(image_bytes), "image/jpeg")
+        )
+        file_id = uploaded.id
+        log.info("Файл загружен в GigaChat, id=%s", file_id)
+    except Exception as e:
+        log.error("Не удалось загрузить файл: %s", e)
+        raise
+
     hint = {
         "math": "Это математика. Реши и дай ответ.",
         "history": "Это история. Ответь на вопрос по картинке.",
         "general": "",
     }.get(subject, "")
 
+    # 2. Отправляем сообщение с прикреплённым изображением
     payload = Chat(
         messages=[
             Messages(role=MessagesRole.SYSTEM, content=SYSTEM_PROMPT + "\n" + hint),
-            Messages(role=MessagesRole.USER, content=caption or "Реши задачу с картинки и дай ответ."),
+            Messages(
+                role=MessagesRole.USER,
+                content=caption or "Реши задачу с картинки и дай ответ.",
+                attachments=[file_id],
+            ),
         ],
         temperature=0.2,
     )
-    return await _request_with_retry(payload)
+    return await _call_with_retry(payload)
