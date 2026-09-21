@@ -7,14 +7,12 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-# --- Логирование в stdout, чтобы BotHost показывал ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("bot")
 
-# --- Импорт solver с диагностикой ---
 try:
     from solver import solve_text, solve_image
     log.info("solver.py успешно импортирован")
@@ -23,7 +21,6 @@ except Exception as e:
     traceback.print_exc()
     raise
 
-# --- Токен из переменных окружения BotHost ---
 TELEGRAM_TOKEN = (
     os.getenv("TELEGRAM_TOKEN")
     or os.getenv("BOT_TOKEN")
@@ -39,22 +36,48 @@ if not TELEGRAM_TOKEN:
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
+
+# user_id -> код предмета
 user_subject: dict[int, str] = {}
+
+# --- Список предметов: (название кнопки, код) ---
+SUBJECTS = [
+    ("🧮 Алгебра", "algebra"),
+    ("📐 Геометрия", "geometry"),
+    ("🇷🇺 Русский", "russian"),
+    ("📖 Литература", "literature"),
+    ("📜 История", "history"),
+    ("🌍 География", "geography"),
+    ("🧬 Биология", "biology"),
+    ("⚡ Физика", "physics"),
+    ("💻 Информатика", "cs"),
+    ("🇬🇧 Английский", "english"),
+    ("🧪 Химия", "chemistry"),
+    ("💬 Общее", "general"),
+]
+
+SUBJECT_NAMES = {code: name for name, code in SUBJECTS}
+SUBJECT_NAMES["general"] = "💬 Общее"
 
 
 def subject_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🧮 Математика", callback_data="subj:math"),
-        InlineKeyboardButton(text="📜 История", callback_data="subj:history"),
-        InlineKeyboardButton(text="💬 Общее", callback_data="subj:general"),
-    ]])
+    """Строит клавиатуру по 3 кнопки в ряд."""
+    rows = []
+    for i in range(0, len(SUBJECTS), 3):
+        row = [
+            InlineKeyboardButton(text=name, callback_data=f"subj:{code}")
+            for name, code in SUBJECTS[i:i + 3]
+        ]
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_subject[message.from_user.id] = "general"
     await message.answer(
-        "Привет! Кинь текст или фото задачи — я дам ответ.\nВыбери предмет:",
+        "Привет! Выбери предмет, потом кидай задачу (текстом или фото).\n"
+        "Отвечу коротко — только ответ.",
         reply_markup=subject_kb(),
     )
 
@@ -66,16 +89,16 @@ async def cmd_subject(message: types.Message):
 
 @dp.callback_query(F.data.startswith("subj:"))
 async def cb_subject(call: CallbackQuery):
-    subj = call.data.split(":")[1]
+    subj = call.data.split(":", 1)[1]
     user_subject[call.from_user.id] = subj
-    names = {"math": "Математика", "history": "История", "general": "Общее"}
-    await call.message.edit_text(f"Режим: {names[subj]}")
+    name = SUBJECT_NAMES.get(subj, subj)
+    await call.message.edit_text(f"Режим: {name}\nКидай задачу.")
     await call.answer()
 
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
-    await message.answer("Обрабатываю фото...")
+    await message.answer("Решаю...")
     try:
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
