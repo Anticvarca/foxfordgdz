@@ -1,18 +1,18 @@
 import base64
+import os
 import httpx
 from openai import AsyncOpenAI
 
-# ============================================================
-# ВСТАВЬ СВОЙ КЛЮЧ OPENAI ЗДЕСЬ (если на бесплатном тарифе BotHost)
-# На платном тарифе замени на: import os; OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-# ============================================================
-OPENAI_API_KEY = "СЮДА_ВСТАВЬ_КЛЮЧ_OPENAI"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+if not OPENAI_API_KEY:
+    raise SystemExit("Переменная OPENAI_API_KEY не задана в панели BotHost!")
 
 
 # --- Обход несовместимости httpx 0.28+ и openai (параметр 'proxies') ---
 class CustomAsyncHTTPClient(httpx.AsyncClient):
     def __init__(self, *args, **kwargs):
-        kwargs.pop("proxies", None)  # убираем проблемный аргумент
+        kwargs.pop("proxies", None)
         super().__init__(*args, **kwargs)
 
 
