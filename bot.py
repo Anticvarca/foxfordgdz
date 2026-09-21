@@ -1,16 +1,18 @@
 import asyncio
 import io
+import os
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 from solver import solve_text, solve_image
 
-# --- НАСТРОЙКИ ДЛЯ БЕСПЛАТНОГО ТАРИФА ---
-# Вставь сюда свои значения!
-TELEGRAM_TOKEN = "СЮДА_ВСТАВЬ_ТОКЕН_ОТ_BOTFATHER"
-OPENAI_API_KEY = "СЮДА_ВСТАВЬ_КЛЮЧ_OPENAI"
-# ----------------------------------------
+# --- Читаем переменные окружения, которые заданы в панели BotHost ---
+# .strip() убирает случайные пробелы и переносы строк, которые добавляет панель
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+
+if not TELEGRAM_TOKEN:
+    raise SystemExit("Переменная TELEGRAM_TOKEN не задана в панели BotHost!")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
