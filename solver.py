@@ -1,7 +1,9 @@
+import asyncio
 import base64
 import os
 import logging
 from gigachat import GigaChat
+from gigachat.exceptions import ResponseError
 from gigachat.models import Chat, Messages, MessagesRole
 
 logging.basicConfig(level=logging.INFO)
@@ -15,13 +17,38 @@ if not GIGACHAT_CREDENTIALS:
 else:
     log.info("GIGACHAT_CREDENTIALS получен, длина %d", len(GIGACHAT_CREDENTIALS))
 
-# Создаём клиент даже с пустым ключом, чтобы импорт не падал.
 client = GigaChat(
     credentials=GIGACHAT_CREDENTIALS or "dummy",
     scope=GIGACHAT_SCOPE,
     verify_ssl_certs=False,
     model="GigaChat",
 )
+
+# --- Защита от одновременных запросов и 429 ---
+_giga_lock = asyncio.Lock()
+
+
+async def _request_with_retry(payload: Chat, max_attempts: int = 3) -> str:
+    """Отправляет запрос в GigaChat с ретраями при 429."""
+    async with _giga_lock:
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await client.achat(payload)
+                return response.choices[0].message.content
+            except ResponseError as e:
+                status = getattr(e, "status_code", None)
+                last_error = e
+                if status == 429:
+                    wait = 1.5 * attempt
+                    log.warning("429 от GigaChat, ждём %.1fs и повторяем (%d/%d)",
+                                wait, attempt, max_attempts)
+                    await asyncio.sleep(wait)
+                    continue
+                log.error("Ошибка GigaChat: %s", e)
+                raise
+        raise last_error
+
 
 SYSTEM_PROMPT = """Ты — умный помощник. Пользователь взрослый, ему нужен готовый ответ.
 Правила:
@@ -47,13 +74,10 @@ async def solve_text(question: str, subject: str = "general") -> str:
         ],
         temperature=0.2,
     )
-
-    response = await client.achat(payload)
-    return response.choices[0].message.content
+    return await _request_with_retry(payload)
 
 
 async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "general") -> str:
-    # GigaChat пока без Vision в этом коде — работаем по подписи
     hint = {
         "math": "Это математика. Реши и дай ответ.",
         "history": "Это история. Ответь на вопрос по картинке.",
@@ -67,6 +91,4 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
         ],
         temperature=0.2,
     )
-
-    response = await client.achat(payload)
-    return response.choices[0].message.content
+    return await _request_with_retry(payload)
