@@ -86,12 +86,11 @@ async def solve_text(question: str, subject: str = "general") -> str:
     return await _call_with_retry(payload)
 
 async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "general") -> str:
-    # 1. Загружаем файл в GigaChat, получаем его id
     try:
         uploaded = await client.aupload_file(
             ("image.jpg", io.BytesIO(image_bytes), "image/jpeg")
         )
-        file_id = uploaded.id_  # <--- ИСПРАВЛЕНО ЗДЕСЬ
+        file_id = uploaded.id_
         log.info("Файл загружен в GigaChat, id=%s", file_id)
     except Exception as e:
         log.error("Не удалось загрузить файл: %s", e)
@@ -103,7 +102,9 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
         "general": "",
     }.get(subject, "")
 
-    # 2. Отправляем сообщение с прикреплённым изображением
+    # ↓↓↓ тоже меняем температуру
+    temp = 0.1 if subject == "math" else 0.3
+
     payload = Chat(
         messages=[
             Messages(role=MessagesRole.SYSTEM, content=SYSTEM_PROMPT + "\n" + hint),
@@ -113,6 +114,6 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
                 attachments=[file_id],
             ),
         ],
-        temperature=0.2,
+        temperature=temp,   # ← было 0.2, стало temp
     )
     return await _call_with_retry(payload)
