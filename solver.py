@@ -1,11 +1,21 @@
-import os
 import base64
+import httpx
 from openai import AsyncOpenAI
 
-OPENAI_API_KEY = "СЮДА_ВСТАВЬ_КЛЮЧ_OPENAI" 
+# --- Кастомный клиент, который убирает 'proxies' ---
+class CustomAsyncHTTPClient(httpx.AsyncClient):
+    def __init__(self, *args, **kwargs):
+        kwargs.pop("proxies", None)   # удаляем проблемный аргумент
+        super().__init__(*args, **kwargs)
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+OPENAI_API_KEY = "ТВОЙ_КЛЮЧ"  # или os.getenv, если на платном тарифе
 
+client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    http_client=CustomAsyncHTTPClient(),   # подставляем свой клиент
+)
+
+# ... остальной код solve_text и solve_image без изменений
 SYSTEM_PROMPT = """Ты — умный помощник. Пользователь взрослый, ему нужен готовый ответ.
 Правила:
 1. ВСЕГДА давай итоговый ответ. Никогда не отказывайся и не проси решить самому.
