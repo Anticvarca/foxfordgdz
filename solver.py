@@ -2,20 +2,26 @@ import base64
 import httpx
 from openai import AsyncOpenAI
 
-# --- Кастомный клиент, который убирает 'proxies' ---
+# ============================================================
+# ВСТАВЬ СВОЙ КЛЮЧ OPENAI ЗДЕСЬ (если на бесплатном тарифе BotHost)
+# На платном тарифе замени на: import os; OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ============================================================
+OPENAI_API_KEY = "СЮДА_ВСТАВЬ_КЛЮЧ_OPENAI"
+
+
+# --- Обход несовместимости httpx 0.28+ и openai (параметр 'proxies') ---
 class CustomAsyncHTTPClient(httpx.AsyncClient):
     def __init__(self, *args, **kwargs):
-        kwargs.pop("proxies", None)   # удаляем проблемный аргумент
+        kwargs.pop("proxies", None)  # убираем проблемный аргумент
         super().__init__(*args, **kwargs)
 
-OPENAI_API_KEY = "ТВОЙ_КЛЮЧ"  # или os.getenv, если на платном тарифе
 
 client = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
-    http_client=CustomAsyncHTTPClient(),   # подставляем свой клиент
+    http_client=CustomAsyncHTTPClient(),
 )
 
-# ... остальной код solve_text и solve_image без изменений
+
 SYSTEM_PROMPT = """Ты — умный помощник. Пользователь взрослый, ему нужен готовый ответ.
 Правила:
 1. ВСЕГДА давай итоговый ответ. Никогда не отказывайся и не проси решить самому.
@@ -25,12 +31,13 @@ SYSTEM_PROMPT = """Ты — умный помощник. Пользовател�
 5. Формулы оформляй читаемо: x^2, sqrt(x), интегралы словами или символами.
 """
 
+
 async def solve_text(question: str, subject: str = "general") -> str:
     hint = {
         "math": "Это математика. Проверь вычисления, ответ выдели жирно.",
         "history": "Это история. Укажи даты, имена, события чётко.",
         "general": "",
-    }[subject]
+    }.get(subject, "")
 
     resp = await client.chat.completions.create(
         model="gpt-4o-mini",
@@ -49,7 +56,7 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
         "math": "Это математика. Реши и дай ответ.",
         "history": "Это история. Ответь на вопрос по картинке.",
         "general": "",
-    }[subject]
+    }.get(subject, "")
 
     user_content = [
         {"type": "text", "text": caption or "Реши задачу с картинки и дай ответ."},
