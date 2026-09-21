@@ -17,12 +17,12 @@ if not GIGACHAT_CREDENTIALS:
 else:
     log.info("GIGACHAT_CREDENTIALS получен, длина %d", len(GIGACHAT_CREDENTIALS))
 
-# ВАЖНО: для Vision нужна Pro или Max. Если Pro недоступен — упадёт.
+# ВАЖНО: для Vision нужна модель Pro или Max.
 client = GigaChat(
     credentials=GIGACHAT_CREDENTIALS or "dummy",
     scope=GIGACHAT_SCOPE,
     verify_ssl_certs=False,
-    model="GigaChat-Pro",
+    model="GigaChat-Pro", # Убедитесь, что ваша подписка поддерживает эту модель
 )
 
 _giga_lock = asyncio.Lock()
@@ -82,7 +82,7 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
         uploaded = await client.aupload_file(
             ("image.jpg", io.BytesIO(image_bytes), "image/jpeg")
         )
-        file_id = uploaded.id
+        file_id = uploaded.id_  # <--- ИСПРАВЛЕНО ЗДЕСЬ
         log.info("Файл загружен в GigaChat, id=%s", file_id)
     except Exception as e:
         log.error("Не удалось загрузить файл: %s", e)
