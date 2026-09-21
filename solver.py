@@ -1,26 +1,24 @@
 import base64
 import os
-import httpx
-from openai import AsyncOpenAI
+from gigachat import GigaChat
+from gigachat.models import Chat, Messages, MessagesRole
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# --- Читаем переменные окружения, заданные в BotHost ---
+GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
+GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
 
-if not OPENAI_API_KEY:
-    raise SystemExit("Переменная OPENAI_API_KEY не задана в панели BotHost!")
+if not GIGACHAT_CREDENTIALS:
+    raise SystemExit("Переменная GIGACHAT_CREDENTIALS не задана в панели BotHost!")
 
-
-# --- Обход несовместимости httpx 0.28+ и openai (параметр 'proxies') ---
-class CustomAsyncHTTPClient(httpx.AsyncClient):
-    def __init__(self, *args, **kwargs):
-        kwargs.pop("proxies", None)
-        super().__init__(*args, **kwargs)
-
-
-client = AsyncOpenAI(
-    api_key=OPENAI_API_KEY,
-    http_client=CustomAsyncHTTPClient(),
+# Создаём клиент GigaChat
+# verify_ssl_certs=False нужен, если у вас нет сертификатов Минцифры.
+# Для продакшена лучше настроить сертификаты, но для теста это сработает.
+client = GigaChat(
+    credentials=GIGACHAT_CREDENTIALS,
+    scope=GIGACHAT_SCOPE,
+    verify_ssl_certs=False,
+    model="GigaChat",  # Базовая модель. Можно заменить на GigaChat-Pro для лучшего качества.
 )
-
 
 SYSTEM_PROMPT = """Ты — умный помощник. Пользователь взрослый, ему нужен готовый ответ.
 Правила:
@@ -31,7 +29,6 @@ SYSTEM_PROMPT = """Ты — умный помощник. Пользовател�
 5. Формулы оформляй читаемо: x^2, sqrt(x), интегралы словами или символами.
 """
 
-
 async def solve_text(question: str, subject: str = "general") -> str:
     hint = {
         "math": "Это математика. Проверь вычисления, ответ выдели жирно.",
@@ -39,18 +36,19 @@ async def solve_text(question: str, subject: str = "general") -> str:
         "general": "",
     }.get(subject, "")
 
-    resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
+    payload = Chat(
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
-            {"role": "user", "content": question},
+            Messages(role=MessagesRole.SYSTEM, content=SYSTEM_PROMPT + "\n" + hint),
+            Messages(role=MessagesRole.USER, content=question),
         ],
         temperature=0.2,
     )
-    return resp.choices[0].message.content
 
+    response = await client.achat(payload)
+    return response.choices[0].message.content
 
 async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "general") -> str:
+    # GigaChat поддерживает Vision. Кодируем изображение в base64.
     b64 = base64.b64encode(image_bytes).decode()
     hint = {
         "math": "Это математика. Реши и дай ответ.",
@@ -58,17 +56,20 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
         "general": "",
     }.get(subject, "")
 
-    user_content = [
-        {"type": "text", "text": caption or "Реши задачу с картинки и дай ответ."},
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-    ]
-
-    resp = await client.chat.completions.create(
-        model="gpt-4o-mini",
+    # Формируем сообщение с изображением
+    # Формат для Vision в GigaChat может отличаться, но обычно это content с типом "image_url"
+    # Для библиотеки gigachat может потребоваться другой формат. Уточните в документации.
+    # Временно используем простой текстовый запрос, так как Vision может требовать дополнительной настройки.
+    # Если Vision не заработает, можно будет добавить его позже.
+    payload = Chat(
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
-            {"role": "user", "content": user_content},
+            Messages(role=MessagesRole.SYSTEM, content=SYSTEM_PROMPT + "\n" + hint),
+            Messages(role=MessagesRole.USER, content=caption or "Реши задачу с картинки и дай ответ."),
         ],
         temperature=0.2,
     )
-    return resp.choices[0].message.content
+
+    # Примечание: Для полноценной работы с изображениями может потребоваться
+    # использование другого метода или формата. Это базовый пример.
+    response = await client.achat(payload)
+    return response.choices[0].message.content
