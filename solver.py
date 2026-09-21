@@ -1,18 +1,23 @@
 import base64
 import os
+import logging
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 
-# --- Переменные окружения ---
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("solver")
+
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip()
 
 if not GIGACHAT_CREDENTIALS:
-    raise SystemExit("Переменная GIGACHAT_CREDENTIALS не задана в панели BotHost!")
+    log.error("GIGACHAT_CREDENTIALS ПУСТОЙ! Задай переменную в панели BotHost.")
+else:
+    log.info("GIGACHAT_CREDENTIALS получен, длина %d", len(GIGACHAT_CREDENTIALS))
 
-# --- Клиент GigaChat (БЕЗ http_client!) ---
+# Создаём клиент даже с пустым ключом, чтобы импорт не падал.
 client = GigaChat(
-    credentials=GIGACHAT_CREDENTIALS,
+    credentials=GIGACHAT_CREDENTIALS or "dummy",
     scope=GIGACHAT_SCOPE,
     verify_ssl_certs=False,
     model="GigaChat",
@@ -26,6 +31,7 @@ SYSTEM_PROMPT = """Ты — умный помощник. Пользовател�
 4. Если данных не хватает — сделай разумное допущение и укажи его.
 5. Формулы оформляй читаемо: x^2, sqrt(x), интегралы словами или символами.
 """
+
 
 async def solve_text(question: str, subject: str = "general") -> str:
     hint = {
@@ -45,8 +51,9 @@ async def solve_text(question: str, subject: str = "general") -> str:
     response = await client.achat(payload)
     return response.choices[0].message.content
 
+
 async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "general") -> str:
-    # GigaChat Vision: пока оставим текстовый fallback, как в прошлой версии
+    # GigaChat пока без Vision в этом коде — работаем по подписи
     hint = {
         "math": "Это математика. Реши и дай ответ.",
         "history": "Это история. Ответь на вопрос по картинке.",
