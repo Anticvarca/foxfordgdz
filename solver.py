@@ -21,7 +21,7 @@ client = GigaChat(
     credentials=GIGACHAT_CREDENTIALS or "dummy",
     scope=GIGACHAT_SCOPE,
     verify_ssl_certs=False,
-    model="GigaChat-Pro",  # если Max доступен — поменяй на "GigaChat-Max"
+    model="GigaChat-Max",   # было GigaChat-Pro
 )
 
 _giga_lock = asyncio.Lock()
