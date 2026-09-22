@@ -113,7 +113,7 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
     ]
 
     resp = await client.chat.completions.create(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-flash"
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
             {"role": "user", "content": user_content},
