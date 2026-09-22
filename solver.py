@@ -14,15 +14,15 @@ if not NVIDIA_API_KEY:
 else:
     log.info("NVIDIA_API_KEY получен, длина %d", len(NVIDIA_API_KEY))
 
-# Таймаут 90 секунд — если NVIDIA не отвечает, упадём с понятной ошибкой
 client = AsyncOpenAI(
     api_key=NVIDIA_API_KEY or "dummy",
     base_url="https://integrate.api.nvidia.com/v1",
     timeout=90.0,
 )
 
-# Разные модели для текста и фото
-TEXT_MODEL = "meta/llama-3.3-70b-instruct"
+# Текст: Nemotron 3 Super (замена снятой с поддержки Llama 3.3 70B)
+TEXT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+# Фото: Llama 3.2 90B Vision — остаётся доступной
 IMAGE_MODEL = "meta/llama-3.2-90b-vision-instruct"
 
 
