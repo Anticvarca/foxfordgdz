@@ -7,12 +7,12 @@ from openai import AsyncOpenAI
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("solver")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
 
-if not OPENAI_API_KEY:
-    log.error("OPENAI_API_KEY ПУСТОЙ! Задай переменную в панели BotHost.")
+if not NVIDIA_API_KEY:
+    log.error("NVIDIA_API_KEY ПУСТОЙ! Задай переменную в панели BotHost.")
 else:
-    log.info("OPENAI_API_KEY получен, длина %d", len(OPENAI_API_KEY))
+    log.info("NVIDIA_API_KEY получен, длина %d", len(NVIDIA_API_KEY))
 
 
 class CustomAsyncHTTPClient(httpx.AsyncClient):
@@ -22,7 +22,8 @@ class CustomAsyncHTTPClient(httpx.AsyncClient):
 
 
 client = AsyncOpenAI(
-    api_key=OPENAI_API_KEY or "dummy",
+    api_key=NVIDIA_API_KEY or "dummy",
+    base_url="https://integrate.api.nvidia.com/v1",
     http_client=CustomAsyncHTTPClient(),
 )
 
@@ -90,7 +91,7 @@ async def solve_text(question: str, subject: str = "general") -> str:
     temp = 0.2 if subject in ("algebra", "geometry", "physics", "cs", "chemistry") else 0.4
 
     resp = await client.chat.completions.create(
-        model="gpt-4o",
+        model="meta/llama-3.2-90b-vision-instruct",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
             {"role": "user", "content": question},
@@ -112,7 +113,7 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
     ]
 
     resp = await client.chat.completions.create(
-        model="gpt-4o",
+        model="meta/llama-3.2-90b-vision-instruct",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
             {"role": "user", "content": user_content},
