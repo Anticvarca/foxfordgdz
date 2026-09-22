@@ -29,7 +29,7 @@ TELEGRAM_TOKEN = (
 ).strip()
 
 log.info("TELEGRAM_TOKEN найден: %s", bool(TELEGRAM_TOKEN))
-log.info("GEMINI_API_KEY найден: %s", bool(os.getenv("GEMINI_API_KEY")))
+log.info("OPENAI_API_KEY найден: %s", bool(os.getenv("OPENAI_API_KEY")))
 
 if not TELEGRAM_TOKEN:
     raise SystemExit("Токен не задан в переменных окружения BotHost")
