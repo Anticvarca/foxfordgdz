@@ -22,7 +22,6 @@ client = AsyncOpenAI(
 
 PRIMARY_TEXT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 FALLBACK_TEXT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
-# Быстрая vision-модель вместо тяжёлой 90B
 IMAGE_MODEL = "meta/llama-3.2-11b-vision-instruct"
 
 
