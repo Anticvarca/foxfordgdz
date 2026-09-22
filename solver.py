@@ -91,7 +91,7 @@ async def solve_text(question: str, subject: str = "general") -> str:
     temp = 0.2 if subject in ("algebra", "geometry", "physics", "cs", "chemistry") else 0.4
 
     resp = await client.chat.completions.create(
-        model="gemini-2.5-flash",
+        model="gemini-3.1-flash",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
             {"role": "user", "content": question},
@@ -113,7 +113,7 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
     ]
 
     resp = await client.chat.completions.create(
-        model="gemini-2.5-flash",
+        model="gemini-3.1-flash",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
             {"role": "user", "content": user_content},
