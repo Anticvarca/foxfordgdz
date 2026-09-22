@@ -7,12 +7,12 @@ from openai import AsyncOpenAI
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("solver")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-if not GEMINI_API_KEY:
-    log.error("GEMINI_API_KEY ПУСТОЙ! Задай переменную в панели BotHost.")
+if not OPENAI_API_KEY:
+    log.error("OPENAI_API_KEY ПУСТОЙ! Задай переменную в панели BotHost.")
 else:
-    log.info("GEMINI_API_KEY получен, длина %d", len(GEMINI_API_KEY))
+    log.info("OPENAI_API_KEY получен, длина %d", len(OPENAI_API_KEY))
 
 
 class CustomAsyncHTTPClient(httpx.AsyncClient):
@@ -22,8 +22,7 @@ class CustomAsyncHTTPClient(httpx.AsyncClient):
 
 
 client = AsyncOpenAI(
-    api_key=GEMINI_API_KEY or "dummy",
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    api_key=OPENAI_API_KEY or "dummy",
     http_client=CustomAsyncHTTPClient(),
 )
 
@@ -91,7 +90,7 @@ async def solve_text(question: str, subject: str = "general") -> str:
     temp = 0.2 if subject in ("algebra", "geometry", "physics", "cs", "chemistry") else 0.4
 
     resp = await client.chat.completions.create(
-        model="gemini-3.6-flash",
+        model="gpt-4o",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
             {"role": "user", "content": question},
@@ -113,7 +112,7 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
     ]
 
     resp = await client.chat.completions.create(
-        model="gemini-3.6-flash",
+        model="gpt-4o",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
             {"role": "user", "content": user_content},
