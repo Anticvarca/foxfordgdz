@@ -14,14 +14,12 @@ if not OPENAI_API_KEY:
 else:
     log.info("OPENAI_API_KEY получен, длина %d", len(OPENAI_API_KEY))
 
-# Обычный клиент OpenAI
 client = AsyncOpenAI(
     api_key=OPENAI_API_KEY or "dummy",
     timeout=60.0,
 )
 
-# Одна модель для всего — gpt-4o
-MODEL = "gpt-4o"
+MODEL = "gpt-4o-mini"
 
 
 SYSTEM_PROMPT = """Ты — бот, который РЕШАЕТ школьные домашние задания. Ты не задаёшь вопросы и не даёшь задания — ты выполняешь их.
