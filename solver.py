@@ -20,9 +20,9 @@ client = AsyncOpenAI(
     timeout=90.0,
 )
 
-# Текст: Nemotron 3 Super (замена снятой с поддержки Llama 3.3 70B)
-TEXT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
-# Фото: Llama 3.2 90B Vision — остаётся доступной
+# Основная и запасная модели для текста
+PRIMARY_TEXT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+FALLBACK_TEXT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
 IMAGE_MODEL = "meta/llama-3.2-90b-vision-instruct"
 
 
@@ -83,31 +83,57 @@ SUBJECT_HINTS = {
 }
 
 
+async def _call_with_retry(model: str, messages: list, temp: float, max_attempts: int = 3) -> str:
+    """Отправляет запрос с retry при 503/429."""
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            log.info("Попытка %d/%d, модель=%s", attempt, max_attempts, model)
+            resp = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temp,
+                    max_tokens=1500,
+                ),
+                timeout=90.0,
+            )
+            log.info("Успех на попытке %d", attempt)
+            return resp.choices[0].message.content
+        except Exception as e:
+            last_error = e
+            status = getattr(e, "status_code", None)
+            log.warning("Попытка %d не удалась: %s (status=%s)", attempt, e, status)
+            if status in (503, 429) and attempt < max_attempts:
+                wait = 2 ** attempt  # 2, 4, 8 секунд
+                log.info("Ждём %d секунд и повторяем...", wait)
+                await asyncio.sleep(wait)
+                continue
+            break
+    raise last_error
+
+
 async def solve_text(question: str, subject: str = "general") -> str:
     hint = SUBJECT_HINTS.get(subject, "")
     temp = 0.2 if subject in ("algebra", "geometry", "physics", "cs", "chemistry") else 0.4
 
-    log.info("Отправляю запрос в NVIDIA (текст), модель=%s", TEXT_MODEL)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
+        {"role": "user", "content": question},
+    ]
+
+    # Сначала пробуем основную модель
     try:
-        resp = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=TEXT_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
-                    {"role": "user", "content": question},
-                ],
-                temperature=temp,
-                max_tokens=1500,
-            ),
-            timeout=90.0,
-        )
-        log.info("Ответ получен от NVIDIA (текст)")
-        return resp.choices[0].message.content
-    except asyncio.TimeoutError:
-        log.error("NVIDIA не ответил за 90 секунд (текст)")
-        return "Модель не ответила вовремя. Попробуй ещё раз."
+        return await _call_with_retry(PRIMARY_TEXT_MODEL, messages, temp)
     except Exception as e:
-        log.error("Ошибка NVIDIA (текст): %s", e)
+        log.warning("Основная модель %s не справилась: %s. Пробую запасную %s",
+                    PRIMARY_TEXT_MODEL, e, FALLBACK_TEXT_MODEL)
+
+    # Если основная не справилась — пробуем запасную
+    try:
+        return await _call_with_retry(FALLBACK_TEXT_MODEL, messages, temp)
+    except Exception as e:
+        log.error("Обе модели не справились: %s", e)
         return f"Ошибка: {e}"
 
 
@@ -121,25 +147,14 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
     ]
 
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
+        {"role": "user", "content": user_content},
+    ]
+
     log.info("Отправляю запрос в NVIDIA (фото), модель=%s, размер=%d байт", IMAGE_MODEL, len(image_bytes))
     try:
-        resp = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=IMAGE_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=temp,
-                max_tokens=1500,
-            ),
-            timeout=90.0,
-        )
-        log.info("Ответ получен от NVIDIA (фото)")
-        return resp.choices[0].message.content
-    except asyncio.TimeoutError:
-        log.error("NVIDIA не ответил за 90 секунд (фото)")
-        return "Модель не ответила вовремя. Попробуй ещё раз."
+        return await _call_with_retry(IMAGE_MODEL, messages, temp)
     except Exception as e:
         log.error("Ошибка NVIDIA (фото): %s", e)
         return f"Ошибка: {e}"
