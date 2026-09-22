@@ -1,7 +1,6 @@
 import base64
 import os
 import logging
-import httpx
 from openai import AsyncOpenAI
 
 logging.basicConfig(level=logging.INFO)
@@ -14,18 +13,13 @@ if not NVIDIA_API_KEY:
 else:
     log.info("NVIDIA_API_KEY получен, длина %d", len(NVIDIA_API_KEY))
 
-
-class CustomAsyncHTTPClient(httpx.AsyncClient):
-    def __init__(self, *args, **kwargs):
-        kwargs.pop("proxies", None)
-        super().__init__(*args, **kwargs)
-
-
+# Прямой клиент без кастомного http_client
 client = AsyncOpenAI(
     api_key=NVIDIA_API_KEY or "dummy",
     base_url="https://integrate.api.nvidia.com/v1",
-    http_client=CustomAsyncHTTPClient(),
 )
+
+MODEL = "meta/llama-3.2-90b-vision-instruct"
 
 
 SYSTEM_PROMPT = """Ты — бот-помощник по школьным домашним заданиям.
@@ -90,15 +84,17 @@ async def solve_text(question: str, subject: str = "general") -> str:
     hint = SUBJECT_HINTS.get(subject, "")
     temp = 0.2 if subject in ("algebra", "geometry", "physics", "cs", "chemistry") else 0.4
 
+    log.info("Отправляю запрос в NVIDIA (текст), модель=%s", MODEL)
     resp = await client.chat.completions.create(
-        model="meta/llama-3.2-90b-vision-instruct",
+        model=MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
             {"role": "user", "content": question},
         ],
         temperature=temp,
-        max_tokens=2000,
+        max_tokens=1500,
     )
+    log.info("Ответ получен от NVIDIA (текст)")
     return resp.choices[0].message.content
 
 
@@ -112,13 +108,15 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
     ]
 
+    log.info("Отправляю запрос в NVIDIA (фото), модель=%s, размер фото=%d байт", MODEL, len(image_bytes))
     resp = await client.chat.completions.create(
-        model="meta/llama-3.2-90b-vision-instruct",
+        model=MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + hint},
             {"role": "user", "content": user_content},
         ],
         temperature=temp,
-        max_tokens=2000,
+        max_tokens=1500,
     )
+    log.info("Ответ получен от NVIDIA (фото)")
     return resp.choices[0].message.content
