@@ -71,6 +71,7 @@ def subject_kb():
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    log.info("Команда /start от user_id=%s", message.from_user.id)
     user_subject[message.from_user.id] = "general"
     await message.answer(
         "Привет! Выбери предмет, потом кидай задачу (текстом или фото).\n"
@@ -81,6 +82,7 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("subject"))
 async def cmd_subject(message: types.Message):
+    log.info("Команда /subject от user_id=%s", message.from_user.id)
     await message.answer("Выбери предмет:", reply_markup=subject_kb())
 
 
@@ -89,18 +91,21 @@ async def cb_subject(call: CallbackQuery):
     subj = call.data.split(":", 1)[1]
     user_subject[call.from_user.id] = subj
     name = SUBJECT_NAMES.get(subj, subj)
+    log.info("Пользователь %s выбрал предмет: %s", call.from_user.id, subj)
     await call.message.edit_text(f"Режим: {name}\nКидай задачу.")
     await call.answer()
 
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
+    log.info("handle_photo вызван, user_id=%s", message.from_user.id)
     await message.answer("Решаю...")
     try:
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
         buf = io.BytesIO()
         await bot.download_file(file.file_path, buf)
+        log.info("Фото скачано, размер=%d байт", buf.getbuffer().nbytes)
 
         subj = user_subject.get(message.from_user.id, "general")
         answer = await solve_image(buf.getvalue(), message.caption or "", subj)
@@ -114,6 +119,7 @@ async def handle_photo(message: types.Message):
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
+    log.info("handle_text вызван, user_id=%s, текст=%r", message.from_user.id, message.text[:80])
     subj = user_subject.get(message.from_user.id, "general")
     await bot.send_chat_action(message.chat.id, "typing")
     try:
