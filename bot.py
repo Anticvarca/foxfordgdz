@@ -7,7 +7,7 @@ import logging
 import secrets
 import string
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Command
@@ -39,13 +39,14 @@ TELEGRAM_TOKEN = (
 ).strip()
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6112132988"))
-# Цена в звёздах (целое число)
-PRICE_STARS = int(os.getenv("PRICE_STARS", "100"))
+PRICE_STARS = int(os.getenv("PRICE_STARS", "60"))
+SUBSCRIPTION_DAYS = int(os.getenv("SUBSCRIPTION_DAYS", "30"))
 
 log.info("TELEGRAM_TOKEN найден: %s", bool(TELEGRAM_TOKEN))
 log.info("OPENAI_API_KEY найден: %s", bool(os.getenv("OPENAI_API_KEY")))
 log.info("ADMIN_ID=%s", ADMIN_ID)
 log.info("PRICE_STARS=%s", PRICE_STARS)
+log.info("SUBSCRIPTION_DAYS=%s", SUBSCRIPTION_DAYS)
 
 if not TELEGRAM_TOKEN:
     raise SystemExit("Токен не задан в переменных окружения BotHost")
@@ -56,7 +57,7 @@ dp = Dispatcher()
 # ============ ФАЙЛЫ ДАННЫХ ============
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-AUTHORIZED_FILE = DATA_DIR / "authorized.json"
+AUTHORIZED_FILE = DATA_DIR / "authorized.json"        # {uid: expire_iso}
 STATS_FILE = DATA_DIR / "stats.json"
 SUBJECTS_FILE = DATA_DIR / "subjects.json"
 PASSWORDS_FILE = DATA_DIR / "passwords.json"
@@ -81,7 +82,16 @@ def _save(path, data):
         log.warning("Не смог сохранить %s: %s", path, e)
 
 
-authorized: set = set(_load(AUTHORIZED_FILE, []))
+# authorized: {user_id(int): expire_iso(str)}  — доступ с датой окончания
+raw_authorized = _load(AUTHORIZED_FILE, {})
+# Поддержка старого формата (список) — конвертируем
+if isinstance(raw_authorized, list):
+    now_iso = (datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)).isoformat(timespec="seconds")
+    authorized: dict = {int(uid): now_iso for uid in raw_authorized}
+    _save(AUTHORIZED_FILE, {str(k): v for k, v in authorized.items()})
+else:
+    authorized: dict = {int(k): v for k, v in raw_authorized.items()}
+
 stats: dict = _load(STATS_FILE, {})
 user_subject: dict = {int(k): v for k, v in _load(SUBJECTS_FILE, {}).items()}
 passwords: dict = _load(PASSWORDS_FILE, {})
@@ -89,8 +99,12 @@ blocked: set = set(_load(BLOCKED_FILE, []))
 tickets: dict = _load(TICKETS_FILE, {})
 payments: dict = _load(PAYMENTS_FILE, {})
 
-log.info("Загружено: авторизовано=%d, в статистике=%d, режимов=%d, паролей=%d, блок=%d, тикетов=%d",
+log.info("Загружено: подписок=%d, в статистике=%d, режимов=%d, паролей=%d, блок=%d, тикетов=%d",
          len(authorized), len(stats), len(user_subject), len(passwords), len(blocked), len(tickets))
+
+
+def save_authorized():
+    _save(AUTHORIZED_FILE, {str(k): v for k, v in authorized.items()})
 
 
 def touch_user(user, task_type=None):
@@ -144,6 +158,45 @@ def get_open_ticket(user_id: int):
     return None
 
 
+def extend_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS) -> datetime:
+    """Продлевает подписку. Если ещё активна — прибавляет к текущей дате окончания."""
+    now = datetime.now()
+    current_expire_iso = authorized.get(user_id)
+    if current_expire_iso:
+        try:
+            current_expire = datetime.fromisoformat(current_expire_iso)
+            if current_expire > now:
+                new_expire = current_expire + timedelta(days=days)
+            else:
+                new_expire = now + timedelta(days=days)
+        except Exception:
+            new_expire = now + timedelta(days=days)
+    else:
+        new_expire = now + timedelta(days=days)
+
+    authorized[user_id] = new_expire.isoformat(timespec="seconds")
+    save_authorized()
+    return new_expire
+
+
+def get_subscription_status(user_id: int) -> tuple:
+    """
+    Возвращает (status, expire_dt, days_left)
+    status: "active" | "expired" | "none"
+    """
+    if user_id not in authorized:
+        return ("none", None, 0)
+    try:
+        expire_dt = datetime.fromisoformat(authorized[user_id])
+    except Exception:
+        return ("none", None, 0)
+    now = datetime.now()
+    if expire_dt <= now:
+        return ("expired", expire_dt, 0)
+    days_left = (expire_dt - now).days
+    return ("active", expire_dt, days_left)
+
+
 # ============ СОСТОЯНИЯ АДМИНА ============
 admin_states: dict = {}
 
@@ -162,13 +215,38 @@ class AuthMiddleware(BaseMiddleware):
             await event.answer("🚫 Ваш доступ заблокирован. Свяжитесь с продавцом.")
             return
 
-        if user_id in authorized:
-            return await handler(event, data)
-
-        # Не перехватываем успешную оплату — она обрабатывается отдельно
+        # Успешную оплату всегда пропускаем
         if event.successful_payment:
             return await handler(event, data)
 
+        # Проверяем подписку
+        status, expire_dt, days_left = get_subscription_status(user_id)
+
+        if status == "active":
+            # Напоминание за 3 дня до конца
+            if days_left <= 3 and event.text and not event.text.startswith("/"):
+                try:
+                    await event.answer(
+                        f"⏰ Ваша подписка истекает через {days_left} дн. "
+                        f"Продлить — /buy"
+                    )
+                except Exception:
+                    pass
+            return await handler(event, data)
+
+        if status == "expired":
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"💳 Продлить за {PRICE_STARS} ⭐", callback_data="buy")],
+                [InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_start")],
+            ])
+            await event.answer(
+                f"⌛ Ваша подписка истекла.\n"
+                f"Продлить доступ на {SUBSCRIPTION_DAYS} дней — {PRICE_STARS} ⭐.",
+                reply_markup=kb,
+            )
+            return
+
+        # Проверяем пароль (для тех кто оплатил вручную через админа)
         if event.text:
             pwd_key, pwd_info = find_password_by_value(event.text)
             if pwd_key:
@@ -178,15 +256,21 @@ class AuthMiddleware(BaseMiddleware):
                     pwd_info["used_by_name"] = event.from_user.full_name
                     pwd_info["used_by_username"] = event.from_user.username or ""
                     _save(PASSWORDS_FILE, passwords)
-                    authorized.add(user_id)
-                    _save(AUTHORIZED_FILE, list(authorized))
+
+                    # Пароль даёт доступ на SUBSCRIPTION_DAYS дней
+                    expire_dt = extend_subscription(user_id)
                     touch_user(event.from_user)
-                    await event.answer("✅ Пароль активирован! Добро пожаловать.", reply_markup=subject_kb())
+                    await event.answer(
+                        f"✅ Пароль активирован! Доступ на {SUBSCRIPTION_DAYS} дней "
+                        f"до {expire_dt.strftime('%d.%m.%Y')}.",
+                        reply_markup=subject_kb(),
+                    )
                     return
                 elif pwd_info.get("used_by") == user_id:
-                    authorized.add(user_id)
-                    _save(AUTHORIZED_FILE, list(authorized))
-                    await event.answer("✅ Доступ восстановлен.")
+                    expire_dt = extend_subscription(user_id)
+                    await event.answer(
+                        f"✅ Доступ продлён до {expire_dt.strftime('%d.%m.%Y')}."
+                    )
                     return
                 else:
                     await event.answer("❌ Этот пароль уже активирован другим пользователем.")
@@ -197,8 +281,8 @@ class AuthMiddleware(BaseMiddleware):
             [InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_start")],
         ])
         await event.answer(
-            "🔒 Доступ закрыт.\n"
-            "Купи доступ или напиши в поддержку, если уже оплатил.",
+            f"🔒 Доступ закрыт.\n\n"
+            f"Подписка на {SUBSCRIPTION_DAYS} дней — {PRICE_STARS} ⭐.",
             reply_markup=kb,
         )
 
@@ -235,8 +319,9 @@ def admin_kb():
          InlineKeyboardButton(text="🗑 Удалить пароли", callback_data="admin:del_menu")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"),
          InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
-        [InlineKeyboardButton(text="🎫 Тикеты", callback_data="admin:tickets"),
-         InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh")],
+        [InlineKeyboardButton(text="💳 Подписки", callback_data="admin:subs"),
+         InlineKeyboardButton(text="🎫 Тикеты", callback_data="admin:tickets")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh")],
     ])
 
 
@@ -254,22 +339,38 @@ def admin_panel_text() -> str:
     used_pwd = sum(1 for v in passwords.values() if v.get("used_by"))
     free_pwd = total_pwd - used_pwd
     open_tickets = sum(1 for t in tickets.values() if t["status"] == "open")
-    total_payments = len([p for p in payments.values() if p.get("status") == "paid"])
+
+    active_subs = 0
+    expired_subs = 0
+    for uid, exp_iso in authorized.items():
+        try:
+            exp_dt = datetime.fromisoformat(exp_iso)
+            if exp_dt > datetime.now():
+                active_subs += 1
+            else:
+                expired_subs += 1
+        except Exception:
+            expired_subs += 1
+
+    paid = [p for p in payments.values() if p.get("status") == "paid"]
+    total_stars = sum(p.get("amount", 0) for p in paid)
+
     return (
         f"🎛 Админ-панель\n\n"
         f"🔑 Паролей: {total_pwd} (🆓 {free_pwd} / ✅ {used_pwd})\n"
-        f"👥 Авторизованных: {len(authorized)}\n"
+        f"💳 Подписок активных: {active_subs}\n"
+        f"⌛ Подписок истекших: {expired_subs}\n"
         f"🚫 Заблокированных: {len(blocked)}\n"
         f"🎫 Открытых тикетов: {open_tickets}\n"
-        f"💰 Оплат через Stars: {total_payments}\n"
-        f"⭐ Цена доступа: {PRICE_STARS} звёзд"
+        f"💰 Оплат всего: {len(paid)} на {total_stars} ⭐\n"
+        f"⭐ Цена: {PRICE_STARS} звёзд / {SUBSCRIPTION_DAYS} дней"
     )
 
 
 dp.message.middleware(AuthMiddleware())
 
 
-# ============ КОМАНДЫ ДЛЯ ПОЛЬЗОВАТЕЛЯ ============
+# ============ КОМАНДЫ ============
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id not in user_subject:
@@ -277,8 +378,15 @@ async def cmd_start(message: types.Message):
         _save(SUBJECTS_FILE, {str(k): v for k, v in user_subject.items()})
     touch_user(message.from_user)
     current = SUBJECT_NAMES.get(user_subject[message.from_user.id], "💬 Общее")
+
+    status, expire_dt, days_left = get_subscription_status(message.from_user.id)
+    sub_line = ""
+    if status == "active":
+        sub_line = f"\n💳 Подписка до {expire_dt.strftime('%d.%m.%Y')} ({days_left} дн.)"
+
     await message.answer(
-        f"Привет! Текущий режим: {current}\nВыбери предмет или сразу кидай задачу.",
+        f"Привет! Текущий режим: {current}{sub_line}\n"
+        "Выбери предмет или сразу кидай задачу.",
         reply_markup=subject_kb(),
     )
 
@@ -290,42 +398,73 @@ async def cmd_subject(message: types.Message):
     await message.answer(f"Сейчас выбран: {current_name}\nВыбери новый:", reply_markup=subject_kb())
 
 
+@dp.message(Command("mysub"))
+async def cmd_mysub(message: types.Message):
+    """Показать статус подписки."""
+    status, expire_dt, days_left = get_subscription_status(message.from_user.id)
+    if status == "active":
+        await message.answer(
+            f"💳 Ваша подписка активна.\n"
+            f"📅 Действует до: {expire_dt.strftime('%d.%m.%Y %H:%M')}\n"
+            f"⏰ Осталось: {days_left} дн."
+        )
+    elif status == "expired":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Продлить за {PRICE_STARS} ⭐", callback_data="buy")],
+        ])
+        await message.answer(
+            f"⌛ Ваша подписка истекла {expire_dt.strftime('%d.%m.%Y')}.\n"
+            f"Продлить — {PRICE_STARS} ⭐.",
+            reply_markup=kb,
+        )
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Купить за {PRICE_STARS} ⭐", callback_data="buy")],
+        ])
+        await message.answer(
+            "У вас нет активной подписки.",
+            reply_markup=kb,
+        )
+
+
 @dp.message(Command("buy"))
 async def cmd_buy(message: types.Message):
-    if message.from_user.id in authorized:
-        await message.answer("✅ У вас уже есть доступ. Повторная оплата не требуется.")
-        return
-    if user_has_password_activated(message.from_user.id):
-        await message.answer("✅ У вас уже есть доступ (пароль активирован).")
-        return
-
     await send_stars_invoice(message)
 
 
 @dp.callback_query(F.data == "buy")
 async def cb_buy(call: CallbackQuery):
-    if call.from_user.id in authorized:
-        await call.answer("✅ Доступ уже есть", show_alert=True)
-        return
     await send_stars_invoice(call.message)
     await call.answer()
 
 
 async def send_stars_invoice(message: types.Message):
     """Отправляет счёт на оплату через Telegram Stars."""
+    status, expire_dt, days_left = get_subscription_status(message.from_user.id)
+    if status == "active":
+        title = "Продление подписки"
+        description = (
+            f"Продление доступа на {SUBSCRIPTION_DAYS} дней.\n"
+            f"Текущая подписка активна до {expire_dt.strftime('%d.%m.%Y')}.\n"
+            f"Новые {SUBSCRIPTION_DAYS} дней добавятся к текущей дате."
+        )
+    else:
+        title = "Подписка на ФоксФорд ГДЗ"
+        description = (
+            f"Доступ к боту на {SUBSCRIPTION_DAYS} дней.\n"
+            f"После оплаты получите доступ ко всем предметам."
+        )
+
     try:
         await bot.send_invoice(
             chat_id=message.chat.id,
-            title="Доступ к ФоксФорд ГДЗ",
-            description=(
-                f"Доступ к боту для решения домашних заданий.\n"
-                f"После оплаты вы сразу получите доступ ко всем предметам."
-            ),
-            payload=f"access_{message.from_user.id}_{int(datetime.now().timestamp())}",
-            provider_token="",           # для Stars всегда пустой
-            currency="XTR",               # валюта Stars
-            prices=[LabeledPrice(label="Доступ", amount=PRICE_STARS)],
-            start_parameter="buy_access",
+            title=title,
+            description=description,
+            payload=f"sub_{message.from_user.id}_{int(datetime.now().timestamp())}",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"Подписка на {SUBSCRIPTION_DAYS} дней", amount=PRICE_STARS)],
+            start_parameter="buy_subscription",
         )
         log.info("Отправлен счёт на %d ⭐ юзеру %s", PRICE_STARS, message.from_user.id)
     except Exception as e:
@@ -336,22 +475,19 @@ async def send_stars_invoice(message: types.Message):
 
 @dp.pre_checkout_query()
 async def pre_checkout(query: PreCheckoutQuery):
-    """Подтверждаем готовность к оплате."""
     await query.answer(ok=True)
 
 
 @dp.message(F.successful_payment)
 async def successful_payment(message: types.Message):
-    """Выдаём доступ после успешной оплаты."""
+    """Продлеваем подписку после успешной оплаты."""
     user = message.from_user
     amount = message.successful_payment.total_amount
     charge_id = message.successful_payment.provider_charge_id
     payload = message.successful_payment.invoice_payload
 
-    log.info("Успешная оплата %s ⭐ от %s (%s), charge=%s",
-             amount, user.id, user.full_name, charge_id)
+    log.info("Оплата %s ⭐ от %s (%s), charge=%s", amount, user.id, user.full_name, charge_id)
 
-    # Записываем платёж
     payments[charge_id] = {
         "user_id": user.id,
         "amount": amount,
@@ -361,37 +497,17 @@ async def successful_payment(message: types.Message):
     }
     _save(PAYMENTS_FILE, payments)
 
-    # Если уже есть доступ — не выдаём повторно
-    if user.id in authorized:
-        await message.answer("✅ Оплата получена. У вас уже есть доступ.")
-        return
-
-    # Генерируем пароль и выдаём доступ
-    pwd = generate_password()
-    while pwd in passwords:
-        pwd = generate_password()
-
-    passwords[pwd] = {
-        "created": datetime.now().isoformat(timespec="seconds"),
-        "used_by": user.id,
-        "used_at": datetime.now().isoformat(timespec="seconds"),
-        "used_by_name": user.full_name,
-        "used_by_username": user.username or "",
-        "note": "auto-issued после оплаты Stars",
-    }
-    _save(PASSWORDS_FILE, passwords)
-
-    authorized.add(user.id)
-    _save(AUTHORIZED_FILE, list(authorized))
+    # Продлеваем подписку
+    new_expire = extend_subscription(user.id)
     touch_user(user)
 
-    log.info("Выдан пароль %s юзеру %s после оплаты %s ⭐", pwd, user.id, amount)
+    log.info("Подписка юзера %s продлена до %s", user.id, new_expire)
 
     await message.answer(
-        f"✅ Оплата получена! Доступ открыт.\n\n"
-        f"🔑 Ваш пароль:\n`{pwd}`\n\n"
-        f"Он уже активирован для вас. Просто пользуйтесь ботом!",
-        parse_mode="Markdown",
+        f"✅ Оплата получена! Подписка активна.\n\n"
+        f"📅 Действует до: {new_expire.strftime('%d.%m.%Y %H:%M')}\n"
+        f"⏰ Это {SUBSCRIPTION_DAYS} дней доступа.\n\n"
+        f"Проверить статус — /mysub",
         reply_markup=subject_kb(),
     )
 
@@ -403,7 +519,7 @@ async def successful_payment(message: types.Message):
             f"👤 {user.full_name} (@{user.username or '—'})\n"
             f"🆔 {user.id}\n"
             f"⭐ {amount} звёзд\n"
-            f"🔑 Пароль: {pwd}",
+            f"📅 Подписка до: {new_expire.strftime('%d.%m.%Y')}",
         )
     except Exception as e:
         log.warning("Не смог уведомить админа: %s", e)
@@ -438,7 +554,7 @@ async def cmd_admin(message: types.Message):
     await message.answer(admin_panel_text(), reply_markup=admin_kb())
 
 
-# ============ ПОДДЕРЖКА: ПОЛЬЗОВАТЕЛЬ ПИШЕТ ============
+# ============ ПОДДЕРЖКА ============
 @dp.message(lambda m: m.from_user.id != ADMIN_ID
             and not m.text.startswith("/")
             and (m.text or m.caption)
@@ -464,8 +580,7 @@ async def handle_support_message(message: types.Message):
         await bot.send_message(
             ADMIN_ID,
             f"🆘 Сообщение от {message.from_user.full_name} (@{message.from_user.username or '—'}, id {message.from_user.id})\n"
-            f"🎫 Тикет: {tid}\n\n"
-            f"{text}",
+            f"🎫 Тикет: {tid}\n\n{text}",
             reply_markup=kb,
         )
     except Exception as e:
@@ -474,7 +589,6 @@ async def handle_support_message(message: types.Message):
     await message.answer("✅ Сообщение отправлено администратору. Ждите ответа.")
 
 
-# ============ АДМИН: ОТВЕТ НА ТИКЕТ ============
 @dp.callback_query(F.data.startswith("ticket:"))
 async def cb_ticket(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
@@ -517,8 +631,7 @@ async def handle_admin_ticket_reply(message: types.Message):
 
     reply_text = message.text or "[пусто]"
     tickets[tid]["messages"].append({
-        "from": "admin",
-        "text": reply_text,
+        "from": "admin", "text": reply_text,
         "time": datetime.now().isoformat(timespec="seconds"),
     })
     _save(TICKETS_FILE, tickets)
@@ -531,7 +644,7 @@ async def handle_admin_ticket_reply(message: types.Message):
         await message.answer(f"❌ Не смог отправить: {e}")
 
 
-# ============ АДМИН: УДАЛЕНИЕ ПАРОЛЯ ПО ТЕКСТУ ============
+# ============ АДМИН: УДАЛЕНИЕ ПАРОЛЯ ============
 @dp.message(lambda m: m.from_user.id == ADMIN_ID
             and admin_states.get(ADMIN_ID) == "awaiting_password_to_delete"
             and m.text)
@@ -542,15 +655,9 @@ async def handle_admin_delete_password(message: types.Message):
     if not pwd_key:
         await message.answer(f"❌ Пароль `{value}` не найден.")
         return
-    used_by = info.get("used_by")
     del passwords[pwd_key]
     _save(PASSWORDS_FILE, passwords)
-    if used_by:
-        authorized.discard(used_by)
-        _save(AUTHORIZED_FILE, list(authorized))
-        await message.answer(f"✅ Пароль `{pwd_key}` удалён.\n🚫 Доступ пользователя {used_by} отозван.")
-    else:
-        await message.answer(f"✅ Свободный пароль `{pwd_key}` удалён.")
+    await message.answer(f"✅ Пароль `{pwd_key}` удалён.")
 
 
 # ============ CALLBACK: АДМИН-ПАНЕЛЬ ============
@@ -570,7 +677,7 @@ async def cb_admin(call: CallbackQuery):
                           "used_by": None, "used_at": None, "note": ""}
         _save(PASSWORDS_FILE, passwords)
         await call.message.answer(
-            f"🔑 Новый пароль:\n\n`{pwd}`\n\nСкопируй и продай покупателю.",
+            f"🔑 Новый пароль:\n\n`{pwd}`\n\nПри активации даёт {SUBSCRIPTION_DAYS} дней доступа.",
             parse_mode="Markdown",
         )
         await call.answer("Создан")
@@ -586,7 +693,9 @@ async def cb_admin(call: CallbackQuery):
             new_pwds.append(pwd)
         _save(PASSWORDS_FILE, passwords)
         await call.message.answer(
-            "🔑 5 новых паролей:\n\n" + "\n".join(f"`{p}`" for p in new_pwds),
+            "🔑 5 новых паролей (каждый = {SUBSCRIPTION_DAYS} дней):\n\n".replace(
+                "{SUBSCRIPTION_DAYS}", str(SUBSCRIPTION_DAYS))
+            + "\n".join(f"`{p}`" for p in new_pwds),
             parse_mode="Markdown",
         )
         await call.answer("Создано 5")
@@ -637,18 +746,10 @@ async def cb_admin(call: CallbackQuery):
     elif action == "del_used":
         used = [(p, v) for p, v in passwords.items() if v.get("used_by")]
         count = len(used)
-        revoked = 0
         for p, v in used:
-            uid = v.get("used_by")
-            if uid:
-                authorized.discard(uid)
-                revoked += 1
             del passwords[p]
         _save(PASSWORDS_FILE, passwords)
-        _save(AUTHORIZED_FILE, list(authorized))
-        await call.message.answer(
-            f"🗑 Удалено использованных паролей: {count}\n🚫 Отозван доступ у {revoked} пользователей."
-        )
+        await call.message.answer(f"🗑 Удалено использованных паролей: {count}")
         await call.answer()
 
     elif action == "stats":
@@ -662,7 +763,7 @@ async def cb_admin(call: CallbackQuery):
             "📊 Статистика бота",
             "",
             f"🔑 Паролей: {len(passwords)} (использовано {used_pwd})",
-            f"👥 Авторизованных: {len(authorized)}",
+            f"💳 Подписок: {len(authorized)}",
             f"🚫 Заблокированных: {len(blocked)}",
             f"💰 Оплат: {len(paid)} на {total_stars} ⭐",
             f"✅ Всего задач: {total_tasks}",
@@ -678,6 +779,39 @@ async def cb_admin(call: CallbackQuery):
         await call.message.answer("\n".join(lines))
         await call.answer()
 
+    elif action == "subs":
+        """Список подписок."""
+        if not authorized:
+            await call.message.answer("Подписок пока нет.")
+            await call.answer()
+            return
+        items = []
+        for uid, exp_iso in authorized.items():
+            try:
+                exp_dt = datetime.fromisoformat(exp_iso)
+                now = datetime.now()
+                days = (exp_dt - now).days
+                s = stats.get(str(uid), {})
+                uname = s.get("username", "?")
+                if exp_dt > now:
+                    items.append((exp_dt, uid, uname, days, "✅"))
+                else:
+                    items.append((exp_dt, uid, uname, days, "⌛"))
+            except Exception:
+                pass
+        items.sort(reverse=True)
+        lines = ["💳 Подписки:\n"]
+        for exp_dt, uid, uname, days, status in items[:30]:
+            if status == "✅":
+                lines.append(f"{status} @{uname} (id {uid}) — до {exp_dt.strftime('%d.%m.%Y')} ({days} дн.)")
+            else:
+                lines.append(f"{status} @{uname} (id {uid}) — истекла {exp_dt.strftime('%d.%m.%Y')}")
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "\n... (обрезано)"
+        await call.message.answer(text)
+        await call.answer()
+
     elif action == "users":
         if not stats:
             await call.message.answer("Пока никого нет.")
@@ -689,16 +823,21 @@ async def cb_admin(call: CallbackQuery):
             uid_int = int(uid)
             uname = s.get("username", "?")
             tasks = s.get("tasks", 0)
+            status, _, _ = get_subscription_status(uid_int)
             if uid_int in blocked:
-                status = "🚫"
-            elif uid_int in authorized or uid_int == ADMIN_ID:
-                status = "✅"
+                st = "🚫"
+            elif status == "active":
+                st = "✅"
+            elif status == "expired":
+                st = "⌛"
+            elif uid_int == ADMIN_ID:
+                st = "👑"
             else:
-                status = "❌"
-            label = f"{status} @{uname} · {tasks} задач"
+                st = "❌"
+            label = f"{st} @{uname} · {tasks} задач"
             rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"usr:info:{uid_int}")])
         rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:refresh")])
-        await call.message.answer("👥 Пользователи (кликни для действий):",
+        await call.message.answer("👥 Пользователи:",
                                   reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
         await call.answer()
 
@@ -750,14 +889,20 @@ async def cb_user_action(call: CallbackQuery):
         last_seen = s.get("last_seen", "?")[:10]
         pwd = user_has_password_activated(uid) or "нет"
         is_blocked = uid in blocked
-        is_auth = uid in authorized
 
+        status, expire_dt, days_left = get_subscription_status(uid)
         if is_blocked:
             status_txt = "🚫 ЗАБЛОКИРОВАН"
-        elif is_auth:
-            status_txt = "✅ Авторизован"
+            exp_txt = "—"
+        elif status == "active":
+            status_txt = "✅ Подписка активна"
+            exp_txt = f"{expire_dt.strftime('%d.%m.%Y')} ({days_left} дн.)"
+        elif status == "expired":
+            status_txt = "⌛ Подписка истекла"
+            exp_txt = expire_dt.strftime('%d.%m.%Y')
         else:
-            status_txt = "❌ Не авторизован"
+            status_txt = "❌ Нет подписки"
+            exp_txt = "—"
 
         text = (
             f"👤 Пользователь\n\n"
@@ -765,6 +910,7 @@ async def cb_user_action(call: CallbackQuery):
             f"Имя: {full_name}\n"
             f"Username: @{uname}\n"
             f"Статус: {status_txt}\n"
+            f"Подписка до: {exp_txt}\n"
             f"Пароль: {pwd}\n\n"
             f"📊 Задач: {tasks} (текст {texts}, фото {photos})\n"
             f"Первый раз: {first_seen}\n"
@@ -776,9 +922,12 @@ async def cb_user_action(call: CallbackQuery):
             buttons.append(InlineKeyboardButton(text="✅ Разблокировать", callback_data=f"usr:unblock:{uid}"))
         else:
             buttons.append(InlineKeyboardButton(text="🚫 Заблокировать", callback_data=f"usr:block:{uid}"))
-        buttons.append(InlineKeyboardButton(text="🗑 Удалить из базы", callback_data=f"usr:delete:{uid}"))
+        buttons.append(InlineKeyboardButton(text="🎁 Продлить +30д", callback_data=f"usr:extend:{uid}"))
+        buttons.append(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"usr:delete:{uid}"))
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            buttons,
+            buttons[:2],
+            buttons[2:],
             [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="admin:users")],
         ])
         await call.message.answer(text, reply_markup=kb)
@@ -787,36 +936,43 @@ async def cb_user_action(call: CallbackQuery):
     elif action == "block":
         blocked.add(uid)
         _save(BLOCKED_FILE, list(blocked))
-        authorized.discard(uid)
-        _save(AUTHORIZED_FILE, list(authorized))
-        await call.message.answer(f"🚫 Пользователь {uid} заблокирован. Доступ отозван.")
+        await call.message.answer(f"🚫 Пользователь {uid} заблокирован.")
         await call.answer("Заблокирован")
 
     elif action == "unblock":
         blocked.discard(uid)
         _save(BLOCKED_FILE, list(blocked))
-        pwd = user_has_password_activated(uid)
-        if pwd:
-            authorized.add(uid)
-            _save(AUTHORIZED_FILE, list(authorized))
-        await call.message.answer(
-            f"✅ Пользователь {uid} разблокирован.\n"
-            f"{'Доступ восстановлен.' if pwd else 'Пароль не найден — доступ не выдан.'}"
-        )
+        await call.message.answer(f"✅ Пользователь {uid} разблокирован.")
         await call.answer("Разблокирован")
+
+    elif action == "extend":
+        new_expire = extend_subscription(uid, SUBSCRIPTION_DAYS)
+        await call.message.answer(
+            f"🎁 Подписка юзера {uid} продлена на {SUBSCRIPTION_DAYS} дней.\n"
+            f"📅 До: {new_expire.strftime('%d.%m.%Y')}"
+        )
+        try:
+            await bot.send_message(
+                uid,
+                f"🎁 Ваша подписка продлена администратором на {SUBSCRIPTION_DAYS} дней.\n"
+                f"📅 До: {new_expire.strftime('%d.%m.%Y')}"
+            )
+        except Exception:
+            pass
+        await call.answer("Продлено")
 
     elif action == "delete":
         blocked.discard(uid)
-        authorized.discard(uid)
+        authorized.pop(uid, None)
         stats.pop(str(uid), None)
         for pwd, info in list(passwords.items()):
             if info.get("used_by") == uid:
                 del passwords[pwd]
+        save_authorized()
         _save(BLOCKED_FILE, list(blocked))
-        _save(AUTHORIZED_FILE, list(authorized))
         _save(STATS_FILE, stats)
         _save(PASSWORDS_FILE, passwords)
-        await call.message.answer(f"🗑 Пользователь {uid} удалён из базы.")
+        await call.message.answer(f"🗑 Пользователь {uid} удалён.")
         await call.answer("Удалён")
 
 
