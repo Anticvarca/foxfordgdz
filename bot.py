@@ -11,7 +11,10 @@ from datetime import datetime
 from pathlib import Path
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+    LabeledPrice, PreCheckoutQuery
+)
 from PIL import Image
 
 logging.basicConfig(
@@ -36,10 +39,13 @@ TELEGRAM_TOKEN = (
 ).strip()
 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6112132988"))
+# Цена в звёздах (целое число)
+PRICE_STARS = int(os.getenv("PRICE_STARS", "100"))
 
 log.info("TELEGRAM_TOKEN найден: %s", bool(TELEGRAM_TOKEN))
 log.info("OPENAI_API_KEY найден: %s", bool(os.getenv("OPENAI_API_KEY")))
 log.info("ADMIN_ID=%s", ADMIN_ID)
+log.info("PRICE_STARS=%s", PRICE_STARS)
 
 if not TELEGRAM_TOKEN:
     raise SystemExit("Токен не задан в переменных окружения BotHost")
@@ -55,6 +61,8 @@ STATS_FILE = DATA_DIR / "stats.json"
 SUBJECTS_FILE = DATA_DIR / "subjects.json"
 PASSWORDS_FILE = DATA_DIR / "passwords.json"
 BLOCKED_FILE = DATA_DIR / "blocked.json"
+TICKETS_FILE = DATA_DIR / "tickets.json"
+PAYMENTS_FILE = DATA_DIR / "payments.json"
 
 
 def _load(path, default):
@@ -78,29 +86,11 @@ stats: dict = _load(STATS_FILE, {})
 user_subject: dict = {int(k): v for k, v in _load(SUBJECTS_FILE, {}).items()}
 passwords: dict = _load(PASSWORDS_FILE, {})
 blocked: set = set(_load(BLOCKED_FILE, []))
+tickets: dict = _load(TICKETS_FILE, {})
+payments: dict = _load(PAYMENTS_FILE, {})
 
-log.info("Загружено: авторизовано=%d, в статистике=%d, режимов=%d, паролей=%d, блок=%d",
-         len(authorized), len(stats), len(user_subject), len(passwords), len(blocked))
-
-
-def save_authorized():
-    _save(AUTHORIZED_FILE, list(authorized))
-
-
-def save_stats():
-    _save(STATS_FILE, stats)
-
-
-def save_subjects():
-    _save(SUBJECTS_FILE, {str(k): v for k, v in user_subject.items()})
-
-
-def save_passwords():
-    _save(PASSWORDS_FILE, passwords)
-
-
-def save_blocked():
-    _save(BLOCKED_FILE, list(blocked))
+log.info("Загружено: авторизовано=%d, в статистике=%d, режимов=%d, паролей=%d, блок=%d, тикетов=%d",
+         len(authorized), len(stats), len(user_subject), len(passwords), len(blocked), len(tickets))
 
 
 def touch_user(user, task_type=None):
@@ -112,9 +102,7 @@ def touch_user(user, task_type=None):
             "full_name": user.full_name,
             "first_seen": now,
             "last_seen": now,
-            "tasks": 0,
-            "texts": 0,
-            "photos": 0,
+            "tasks": 0, "texts": 0, "photos": 0,
         }
     stats[uid]["last_seen"] = now
     stats[uid]["username"] = user.username or user.full_name
@@ -124,16 +112,12 @@ def touch_user(user, task_type=None):
     elif task_type == "photo":
         stats[uid]["photos"] = stats[uid].get("photos", 0) + 1
         stats[uid]["tasks"] = stats[uid].get("tasks", 0) + 1
-    save_stats()
+    _save(STATS_FILE, stats)
 
 
-def generate_password(prefix: str = "") -> str:
+def generate_password() -> str:
     alphabet = string.ascii_uppercase + string.digits
     alphabet = alphabet.replace("O", "").replace("0", "").replace("I", "").replace("1", "")
-    if prefix:
-        prefix = re.sub(r"[^A-Z0-9]", "", prefix.upper())[:8]
-        part = "".join(secrets.choice(alphabet) for _ in range(4))
-        return f"{prefix}-{part}"
     parts = ["".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3)]
     return "-".join(parts)
 
@@ -153,8 +137,15 @@ def user_has_password_activated(user_id: int):
     return None
 
 
+def get_open_ticket(user_id: int):
+    for tid, t in tickets.items():
+        if t["user_id"] == user_id and t["status"] == "open":
+            return tid
+    return None
+
+
 # ============ СОСТОЯНИЯ АДМИНА ============
-admin_states: dict = {}   # {admin_id: "awaiting_password_to_delete"}
+admin_states: dict = {}
 
 
 # ============ АУТЕНТИФИКАЦИЯ ============
@@ -167,18 +158,17 @@ class AuthMiddleware(BaseMiddleware):
         if user_id == ADMIN_ID:
             return await handler(event, data)
 
-        # Заблокированные — блокируем сразу, даже если в authorized
         if user_id in blocked:
-            await event.answer(
-                "🚫 Ваш доступ заблокирован.\n"
-                "Если хотите продлить — свяжитесь с продавцом."
-            )
+            await event.answer("🚫 Ваш доступ заблокирован. Свяжитесь с продавцом.")
             return
 
         if user_id in authorized:
             return await handler(event, data)
 
-        # Проверяем, не пароль ли ввёл
+        # Не перехватываем успешную оплату — она обрабатывается отдельно
+        if event.successful_payment:
+            return await handler(event, data)
+
         if event.text:
             pwd_key, pwd_info = find_password_by_value(event.text)
             if pwd_key:
@@ -187,94 +177,72 @@ class AuthMiddleware(BaseMiddleware):
                     pwd_info["used_at"] = datetime.now().isoformat(timespec="seconds")
                     pwd_info["used_by_name"] = event.from_user.full_name
                     pwd_info["used_by_username"] = event.from_user.username or ""
-                    save_passwords()
+                    _save(PASSWORDS_FILE, passwords)
                     authorized.add(user_id)
-                    save_authorized()
+                    _save(AUTHORIZED_FILE, list(authorized))
                     touch_user(event.from_user)
-                    log.info("Пароль %s активирован юзером %s", pwd_key, user_id)
-                    await event.answer(
-                        "✅ Пароль активирован! Добро пожаловать.\n"
-                        "Выбери предмет и кинь задачу.",
-                        reply_markup=subject_kb(),
-                    )
+                    await event.answer("✅ Пароль активирован! Добро пожаловать.", reply_markup=subject_kb())
                     return
                 elif pwd_info.get("used_by") == user_id:
                     authorized.add(user_id)
-                    save_authorized()
+                    _save(AUTHORIZED_FILE, list(authorized))
                     await event.answer("✅ Доступ восстановлен.")
                     return
                 else:
-                    await event.answer(
-                        "❌ Этот пароль уже активирован другим пользователем.\n"
-                        "Если вы купили пароль — напишите продавцу."
-                    )
+                    await event.answer("❌ Этот пароль уже активирован другим пользователем.")
                     return
 
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Купить доступ за {PRICE_STARS} ⭐", callback_data="buy")],
+            [InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_start")],
+        ])
         await event.answer(
-            "🔒 Введи пароль для доступа к боту.\n"
-            "Если у тебя нет пароля — напиши продавцу."
+            "🔒 Доступ закрыт.\n"
+            "Купи доступ или напиши в поддержку, если уже оплатил.",
+            reply_markup=kb,
         )
 
 
 # ============ МЕНЮ ============
 SUBJECTS = [
-    ("🧮 Алгебра", "algebra"),
-    ("📐 Геометрия", "geometry"),
-    ("🇷🇺 Русский", "russian"),
-    ("📖 Литература", "literature"),
-    ("📜 История", "history"),
-    ("🌍 География", "geography"),
-    ("🧬 Биология", "biology"),
-    ("⚡ Физика", "physics"),
-    ("💻 Информатика", "cs"),
-    ("🇬🇧 Английский", "english"),
-    ("🧪 Химия", "chemistry"),
-    ("💬 Общее", "general"),
+    ("🧮 Алгебра", "algebra"), ("📐 Геометрия", "geometry"),
+    ("🇷🇺 Русский", "russian"), ("📖 Литература", "literature"),
+    ("📜 История", "history"), ("🌍 География", "geography"),
+    ("🧬 Биология", "biology"), ("⚡ Физика", "physics"),
+    ("💻 Информатика", "cs"), ("🇬🇧 Английский", "english"),
+    ("🧪 Химия", "chemistry"), ("💬 Общее", "general"),
 ]
-
 SUBJECT_NAMES = {code: name for name, code in SUBJECTS}
 SUBJECT_NAMES["general"] = "💬 Общее"
 
-MODE_PATTERN = re.compile(
-    r"(режим|предмет|урок|класс|работа\w*|сто\w*|выбран|текущ)",
-    re.IGNORECASE,
-)
+MODE_PATTERN = re.compile(r"(режим|предмет|урок|класс|работа\w*|сто\w*|выбран|текущ)", re.IGNORECASE)
 
 
 def subject_kb():
     rows = []
     for i in range(0, len(SUBJECTS), 3):
-        row = [
-            InlineKeyboardButton(text=name, callback_data=f"subj:{code}")
-            for name, code in SUBJECTS[i:i + 3]
-        ]
+        row = [InlineKeyboardButton(text=name, callback_data=f"subj:{code}")
+               for name, code in SUBJECTS[i:i + 3]]
         rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🔑 Сгенерировать 1", callback_data="admin:gen1"),
-            InlineKeyboardButton(text="🔑🔑 5 паролей", callback_data="admin:gen5"),
-        ],
-        [
-            InlineKeyboardButton(text="📋 Список паролей", callback_data="admin:list"),
-            InlineKeyboardButton(text="🗑 Удалить пароли", callback_data="admin:del_menu"),
-        ],
-        [
-            InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"),
-            InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
-        ],
-        [
-            InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh"),
-        ],
+        [InlineKeyboardButton(text="🔑 1 пароль", callback_data="admin:gen1"),
+         InlineKeyboardButton(text="🔑🔑 5 паролей", callback_data="admin:gen5")],
+        [InlineKeyboardButton(text="📋 Список паролей", callback_data="admin:list"),
+         InlineKeyboardButton(text="🗑 Удалить пароли", callback_data="admin:del_menu")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"),
+         InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="🎫 Тикеты", callback_data="admin:tickets"),
+         InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh")],
     ])
 
 
 def admin_del_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑 Удалить конкретный пароль", callback_data="admin:del_one")],
+        [InlineKeyboardButton(text="🗑 Удалить конкретный", callback_data="admin:del_one")],
         [InlineKeyboardButton(text="🗑 Удалить все СВОБОДНЫЕ", callback_data="admin:del_free")],
         [InlineKeyboardButton(text="🗑 Удалить все ИСПОЛЬЗОВАННЫЕ", callback_data="admin:del_used")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:refresh")],
@@ -285,30 +253,32 @@ def admin_panel_text() -> str:
     total_pwd = len(passwords)
     used_pwd = sum(1 for v in passwords.values() if v.get("used_by"))
     free_pwd = total_pwd - used_pwd
+    open_tickets = sum(1 for t in tickets.values() if t["status"] == "open")
+    total_payments = len([p for p in payments.values() if p.get("status") == "paid"])
     return (
         f"🎛 Админ-панель\n\n"
-        f"🔑 Паролей: {total_pwd}\n"
-        f"   🆓 свободных: {free_pwd}\n"
-        f"   ✅ использованных: {used_pwd}\n"
+        f"🔑 Паролей: {total_pwd} (🆓 {free_pwd} / ✅ {used_pwd})\n"
         f"👥 Авторизованных: {len(authorized)}\n"
-        f"🚫 Заблокированных: {len(blocked)}"
+        f"🚫 Заблокированных: {len(blocked)}\n"
+        f"🎫 Открытых тикетов: {open_tickets}\n"
+        f"💰 Оплат через Stars: {total_payments}\n"
+        f"⭐ Цена доступа: {PRICE_STARS} звёзд"
     )
 
 
 dp.message.middleware(AuthMiddleware())
 
 
-# ============ КОМАНДЫ ============
+# ============ КОМАНДЫ ДЛЯ ПОЛЬЗОВАТЕЛЯ ============
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id not in user_subject:
         user_subject[message.from_user.id] = "general"
-        save_subjects()
+        _save(SUBJECTS_FILE, {str(k): v for k, v in user_subject.items()})
     touch_user(message.from_user)
     current = SUBJECT_NAMES.get(user_subject[message.from_user.id], "💬 Общее")
     await message.answer(
-        f"Привет! Текущий режим: {current}\n"
-        "Выбери предмет или сразу кидай задачу (текстом или фото).",
+        f"Привет! Текущий режим: {current}\nВыбери предмет или сразу кидай задачу.",
         reply_markup=subject_kb(),
     )
 
@@ -317,10 +287,147 @@ async def cmd_start(message: types.Message):
 async def cmd_subject(message: types.Message):
     current = user_subject.get(message.from_user.id, "general")
     current_name = SUBJECT_NAMES.get(current, "💬 Общее")
+    await message.answer(f"Сейчас выбран: {current_name}\nВыбери новый:", reply_markup=subject_kb())
+
+
+@dp.message(Command("buy"))
+async def cmd_buy(message: types.Message):
+    if message.from_user.id in authorized:
+        await message.answer("✅ У вас уже есть доступ. Повторная оплата не требуется.")
+        return
+    if user_has_password_activated(message.from_user.id):
+        await message.answer("✅ У вас уже есть доступ (пароль активирован).")
+        return
+
+    await send_stars_invoice(message)
+
+
+@dp.callback_query(F.data == "buy")
+async def cb_buy(call: CallbackQuery):
+    if call.from_user.id in authorized:
+        await call.answer("✅ Доступ уже есть", show_alert=True)
+        return
+    await send_stars_invoice(call.message)
+    await call.answer()
+
+
+async def send_stars_invoice(message: types.Message):
+    """Отправляет счёт на оплату через Telegram Stars."""
+    try:
+        await bot.send_invoice(
+            chat_id=message.chat.id,
+            title="Доступ к ФоксФорд ГДЗ",
+            description=(
+                f"Доступ к боту для решения домашних заданий.\n"
+                f"После оплаты вы сразу получите доступ ко всем предметам."
+            ),
+            payload=f"access_{message.from_user.id}_{int(datetime.now().timestamp())}",
+            provider_token="",           # для Stars всегда пустой
+            currency="XTR",               # валюта Stars
+            prices=[LabeledPrice(label="Доступ", amount=PRICE_STARS)],
+            start_parameter="buy_access",
+        )
+        log.info("Отправлен счёт на %d ⭐ юзеру %s", PRICE_STARS, message.from_user.id)
+    except Exception as e:
+        log.error("Ошибка отправки счёта: %s", e)
+        traceback.print_exc()
+        await message.answer("❌ Не удалось создать счёт. Попробуйте позже.")
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    """Подтверждаем готовность к оплате."""
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: types.Message):
+    """Выдаём доступ после успешной оплаты."""
+    user = message.from_user
+    amount = message.successful_payment.total_amount
+    charge_id = message.successful_payment.provider_charge_id
+    payload = message.successful_payment.invoice_payload
+
+    log.info("Успешная оплата %s ⭐ от %s (%s), charge=%s",
+             amount, user.id, user.full_name, charge_id)
+
+    # Записываем платёж
+    payments[charge_id] = {
+        "user_id": user.id,
+        "amount": amount,
+        "payload": payload,
+        "status": "paid",
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
+    _save(PAYMENTS_FILE, payments)
+
+    # Если уже есть доступ — не выдаём повторно
+    if user.id in authorized:
+        await message.answer("✅ Оплата получена. У вас уже есть доступ.")
+        return
+
+    # Генерируем пароль и выдаём доступ
+    pwd = generate_password()
+    while pwd in passwords:
+        pwd = generate_password()
+
+    passwords[pwd] = {
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "used_by": user.id,
+        "used_at": datetime.now().isoformat(timespec="seconds"),
+        "used_by_name": user.full_name,
+        "used_by_username": user.username or "",
+        "note": "auto-issued после оплаты Stars",
+    }
+    _save(PASSWORDS_FILE, passwords)
+
+    authorized.add(user.id)
+    _save(AUTHORIZED_FILE, list(authorized))
+    touch_user(user)
+
+    log.info("Выдан пароль %s юзеру %s после оплаты %s ⭐", pwd, user.id, amount)
+
     await message.answer(
-        f"Сейчас выбран: {current_name}\nВыбери новый:",
+        f"✅ Оплата получена! Доступ открыт.\n\n"
+        f"🔑 Ваш пароль:\n`{pwd}`\n\n"
+        f"Он уже активирован для вас. Просто пользуйтесь ботом!",
+        parse_mode="Markdown",
         reply_markup=subject_kb(),
     )
+
+    # Уведомляем админа
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"💰 Новая оплата звёздами!\n"
+            f"👤 {user.full_name} (@{user.username or '—'})\n"
+            f"🆔 {user.id}\n"
+            f"⭐ {amount} звёзд\n"
+            f"🔑 Пароль: {pwd}",
+        )
+    except Exception as e:
+        log.warning("Не смог уведомить админа: %s", e)
+
+
+@dp.message(Command("support"))
+async def cmd_support(message: types.Message):
+    open_ticket = get_open_ticket(message.from_user.id)
+    if open_ticket:
+        await message.answer(
+            f"У вас уже есть открытый тикет #{open_ticket}.\n"
+            f"Напишите ваше сообщение — я передам его администратору."
+        )
+        return
+    await message.answer(
+        "🆘 Напишите ваш вопрос — я передам его администратору.\n"
+        "Ответ придёт сюда же, в этот чат."
+    )
+
+
+@dp.callback_query(F.data == "support_start")
+async def cb_support_start(call: CallbackQuery):
+    await call.message.answer("🆘 Напишите ваш вопрос — я передам его администратору.")
+    await call.answer()
 
 
 @dp.message(Command("admin"))
@@ -331,7 +438,100 @@ async def cmd_admin(message: types.Message):
     await message.answer(admin_panel_text(), reply_markup=admin_kb())
 
 
-# ============ АДМИН-СОСТОЯНИЕ (удаление пароля по тексту) ============
+# ============ ПОДДЕРЖКА: ПОЛЬЗОВАТЕЛЬ ПИШЕТ ============
+@dp.message(lambda m: m.from_user.id != ADMIN_ID
+            and not m.text.startswith("/")
+            and (m.text or m.caption)
+            and get_open_ticket(m.from_user.id))
+async def handle_support_message(message: types.Message):
+    tid = get_open_ticket(message.from_user.id)
+    if not tid:
+        return
+
+    text = message.text or message.caption or "[медиа]"
+    tickets[tid]["messages"].append({
+        "from": "user",
+        "text": text,
+        "time": datetime.now().isoformat(timespec="seconds"),
+    })
+    _save(TICKETS_FILE, tickets)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Ответить", callback_data=f"ticket:reply:{tid}")],
+        [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"ticket:close:{tid}")],
+    ])
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🆘 Сообщение от {message.from_user.full_name} (@{message.from_user.username or '—'}, id {message.from_user.id})\n"
+            f"🎫 Тикет: {tid}\n\n"
+            f"{text}",
+            reply_markup=kb,
+        )
+    except Exception as e:
+        log.warning("Не смог уведомить админа: %s", e)
+
+    await message.answer("✅ Сообщение отправлено администратору. Ждите ответа.")
+
+
+# ============ АДМИН: ОТВЕТ НА ТИКЕТ ============
+@dp.callback_query(F.data.startswith("ticket:"))
+async def cb_ticket(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+    action = parts[1]
+    tid = parts[2]
+
+    if tid not in tickets:
+        await call.answer("Тикет не найден", show_alert=True)
+        return
+
+    if action == "reply":
+        admin_states[ADMIN_ID] = f"reply_ticket:{tid}"
+        await call.message.answer(f"✏️ Напиши ответ для тикета {tid}:")
+        await call.answer()
+
+    elif action == "close":
+        tickets[tid]["status"] = "closed"
+        _save(TICKETS_FILE, tickets)
+        uid = tickets[tid]["user_id"]
+        try:
+            await bot.send_message(uid, "✅ Ваш тикет закрыт. Если появятся новые вопросы — /support.")
+        except Exception:
+            pass
+        await call.message.answer(f"🎫 Тикет {tid} закрыт.")
+        await call.answer("Закрыт")
+
+
+@dp.message(lambda m: m.from_user.id == ADMIN_ID
+            and admin_states.get(ADMIN_ID, "").startswith("reply_ticket:"))
+async def handle_admin_ticket_reply(message: types.Message):
+    state = admin_states.pop(ADMIN_ID, "")
+    _, tid = state.split(":", 1)
+    if tid not in tickets:
+        await message.answer("Тикет не найден.")
+        return
+
+    reply_text = message.text or "[пусто]"
+    tickets[tid]["messages"].append({
+        "from": "admin",
+        "text": reply_text,
+        "time": datetime.now().isoformat(timespec="seconds"),
+    })
+    _save(TICKETS_FILE, tickets)
+
+    uid = tickets[tid]["user_id"]
+    try:
+        await bot.send_message(uid, f"📨 Ответ поддержки:\n\n{reply_text}")
+        await message.answer(f"✅ Ответ отправлен пользователю {uid}.")
+    except Exception as e:
+        await message.answer(f"❌ Не смог отправить: {e}")
+
+
+# ============ АДМИН: УДАЛЕНИЕ ПАРОЛЯ ПО ТЕКСТУ ============
 @dp.message(lambda m: m.from_user.id == ADMIN_ID
             and admin_states.get(ADMIN_ID) == "awaiting_password_to_delete"
             and m.text)
@@ -344,14 +544,11 @@ async def handle_admin_delete_password(message: types.Message):
         return
     used_by = info.get("used_by")
     del passwords[pwd_key]
-    save_passwords()
+    _save(PASSWORDS_FILE, passwords)
     if used_by:
         authorized.discard(used_by)
-        save_authorized()
-        await message.answer(
-            f"✅ Пароль `{pwd_key}` удалён.\n"
-            f"🚫 Доступ пользователя {used_by} отозван."
-        )
+        _save(AUTHORIZED_FILE, list(authorized))
+        await message.answer(f"✅ Пароль `{pwd_key}` удалён.\n🚫 Доступ пользователя {used_by} отозван.")
     else:
         await message.answer(f"✅ Свободный пароль `{pwd_key}` удалён.")
 
@@ -360,7 +557,7 @@ async def handle_admin_delete_password(message: types.Message):
 @dp.callback_query(F.data.startswith("admin:"))
 async def cb_admin(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
-        await call.answer("⛔ Только для админа", show_alert=True)
+        await call.answer("⛔", show_alert=True)
         return
 
     action = call.data.split(":", 1)[1]
@@ -369,14 +566,11 @@ async def cb_admin(call: CallbackQuery):
         pwd = generate_password()
         while pwd in passwords:
             pwd = generate_password()
-        passwords[pwd] = {
-            "created": datetime.now().isoformat(timespec="seconds"),
-            "used_by": None, "used_at": None, "note": "",
-        }
-        save_passwords()
+        passwords[pwd] = {"created": datetime.now().isoformat(timespec="seconds"),
+                          "used_by": None, "used_at": None, "note": ""}
+        _save(PASSWORDS_FILE, passwords)
         await call.message.answer(
-            f"🔑 Новый пароль:\n\n`{pwd}`\n\n"
-            f"Скопируй и продай покупателю. Активируется один раз.",
+            f"🔑 Новый пароль:\n\n`{pwd}`\n\nСкопируй и продай покупателю.",
             parse_mode="Markdown",
         )
         await call.answer("Создан")
@@ -387,12 +581,10 @@ async def cb_admin(call: CallbackQuery):
             pwd = generate_password()
             while pwd in passwords:
                 pwd = generate_password()
-            passwords[pwd] = {
-                "created": datetime.now().isoformat(timespec="seconds"),
-                "used_by": None, "used_at": None, "note": "",
-            }
+            passwords[pwd] = {"created": datetime.now().isoformat(timespec="seconds"),
+                              "used_by": None, "used_at": None, "note": ""}
             new_pwds.append(pwd)
-        save_passwords()
+        _save(PASSWORDS_FILE, passwords)
         await call.message.answer(
             "🔑 5 новых паролей:\n\n" + "\n".join(f"`{p}`" for p in new_pwds),
             parse_mode="Markdown",
@@ -426,24 +618,19 @@ async def cb_admin(call: CallbackQuery):
         await call.answer()
 
     elif action == "del_menu":
-        await call.message.answer(
-            "🗑 Управление паролями:",
-            reply_markup=admin_del_kb(),
-        )
+        await call.message.answer("🗑 Управление паролями:", reply_markup=admin_del_kb())
         await call.answer()
 
     elif action == "del_one":
         admin_states[ADMIN_ID] = "awaiting_password_to_delete"
-        await call.message.answer(
-            "Отправь пароль, который нужно удалить (одним сообщением):"
-        )
+        await call.message.answer("Отправь пароль, который нужно удалить:")
         await call.answer()
 
     elif action == "del_free":
         free = [p for p, v in passwords.items() if not v.get("used_by")]
         for p in free:
             del passwords[p]
-        save_passwords()
+        _save(PASSWORDS_FILE, passwords)
         await call.message.answer(f"🗑 Удалено свободных паролей: {len(free)}")
         await call.answer()
 
@@ -457,11 +644,10 @@ async def cb_admin(call: CallbackQuery):
                 authorized.discard(uid)
                 revoked += 1
             del passwords[p]
-        save_passwords()
-        save_authorized()
+        _save(PASSWORDS_FILE, passwords)
+        _save(AUTHORIZED_FILE, list(authorized))
         await call.message.answer(
-            f"🗑 Удалено использованных паролей: {count}\n"
-            f"🚫 Отозван доступ у {revoked} пользователей."
+            f"🗑 Удалено использованных паролей: {count}\n🚫 Отозван доступ у {revoked} пользователей."
         )
         await call.answer()
 
@@ -470,12 +656,15 @@ async def cb_admin(call: CallbackQuery):
         total_texts = sum(s.get("texts", 0) for s in stats.values())
         total_photos = sum(s.get("photos", 0) for s in stats.values())
         used_pwd = sum(1 for v in passwords.values() if v.get("used_by"))
+        paid = [p for p in payments.values() if p.get("status") == "paid"]
+        total_stars = sum(p.get("amount", 0) for p in paid)
         lines = [
             "📊 Статистика бота",
             "",
             f"🔑 Паролей: {len(passwords)} (использовано {used_pwd})",
             f"👥 Авторизованных: {len(authorized)}",
             f"🚫 Заблокированных: {len(blocked)}",
+            f"💰 Оплат: {len(paid)} на {total_stars} ⭐",
             f"✅ Всего задач: {total_tasks}",
             f"   📝 текстом: {total_texts}",
             f"   📷 фото: {total_photos}",
@@ -494,10 +683,7 @@ async def cb_admin(call: CallbackQuery):
             await call.message.answer("Пока никого нет.")
             await call.answer()
             return
-        # Сортируем по дате последнего визита
-        items = sorted(stats.items(),
-                       key=lambda x: x[1].get("last_seen", ""),
-                       reverse=True)[:30]
+        items = sorted(stats.items(), key=lambda x: x[1].get("last_seen", ""), reverse=True)[:30]
         rows = []
         for uid, s in items:
             uid_int = int(uid)
@@ -510,15 +696,28 @@ async def cb_admin(call: CallbackQuery):
             else:
                 status = "❌"
             label = f"{status} @{uname} · {tasks} задач"
-            rows.append([InlineKeyboardButton(
-                text=label[:60],
-                callback_data=f"usr:info:{uid_int}",
-            )])
+            rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"usr:info:{uid_int}")])
         rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:refresh")])
-        await call.message.answer(
-            "👥 Пользователи (кликни для действий):",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-        )
+        await call.message.answer("👥 Пользователи (кликни для действий):",
+                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await call.answer()
+
+    elif action == "tickets":
+        open_tickets = [(tid, t) for tid, t in tickets.items() if t["status"] == "open"]
+        if not open_tickets:
+            await call.message.answer("🎫 Открытых тикетов нет.")
+            await call.answer()
+            return
+        lines = ["🎫 Открытые тикеты:\n"]
+        for tid, t in open_tickets[-10:]:
+            last_msg = t["messages"][-1]["text"][:60] if t["messages"] else ""
+            lines.append(f"#{tid}\n  👤 {t['username']} (id {t['user_id']})\n  📝 {last_msg}...")
+        rows = [[InlineKeyboardButton(text=f"✏️ Ответить #{tid}",
+                                      callback_data=f"ticket:reply:{tid}")]
+                for tid, _ in open_tickets[-10:]]
+        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:refresh")])
+        await call.message.answer("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
         await call.answer()
 
     elif action == "refresh":
@@ -574,13 +773,10 @@ async def cb_user_action(call: CallbackQuery):
 
         buttons = []
         if is_blocked:
-            buttons.append(InlineKeyboardButton(
-                text="✅ Разблокировать", callback_data=f"usr:unblock:{uid}"))
+            buttons.append(InlineKeyboardButton(text="✅ Разблокировать", callback_data=f"usr:unblock:{uid}"))
         else:
-            buttons.append(InlineKeyboardButton(
-                text="🚫 Заблокировать", callback_data=f"usr:block:{uid}"))
-        buttons.append(InlineKeyboardButton(
-            text="🗑 Удалить из базы", callback_data=f"usr:delete:{uid}"))
+            buttons.append(InlineKeyboardButton(text="🚫 Заблокировать", callback_data=f"usr:block:{uid}"))
+        buttons.append(InlineKeyboardButton(text="🗑 Удалить из базы", callback_data=f"usr:delete:{uid}"))
         kb = InlineKeyboardMarkup(inline_keyboard=[
             buttons,
             [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="admin:users")],
@@ -590,21 +786,19 @@ async def cb_user_action(call: CallbackQuery):
 
     elif action == "block":
         blocked.add(uid)
-        save_blocked()
+        _save(BLOCKED_FILE, list(blocked))
         authorized.discard(uid)
-        save_authorized()
-        log.info("Юзер %s заблокирован", uid)
+        _save(AUTHORIZED_FILE, list(authorized))
         await call.message.answer(f"🚫 Пользователь {uid} заблокирован. Доступ отозван.")
         await call.answer("Заблокирован")
 
     elif action == "unblock":
         blocked.discard(uid)
-        save_blocked()
+        _save(BLOCKED_FILE, list(blocked))
         pwd = user_has_password_activated(uid)
         if pwd:
             authorized.add(uid)
-            save_authorized()
-        log.info("Юзер %s разблокирован", uid)
+            _save(AUTHORIZED_FILE, list(authorized))
         await call.message.answer(
             f"✅ Пользователь {uid} разблокирован.\n"
             f"{'Доступ восстановлен.' if pwd else 'Пароль не найден — доступ не выдан.'}"
@@ -618,11 +812,10 @@ async def cb_user_action(call: CallbackQuery):
         for pwd, info in list(passwords.items()):
             if info.get("used_by") == uid:
                 del passwords[pwd]
-        save_blocked()
-        save_authorized()
-        save_stats()
-        save_passwords()
-        log.info("Юзер %s удалён из базы", uid)
+        _save(BLOCKED_FILE, list(blocked))
+        _save(AUTHORIZED_FILE, list(authorized))
+        _save(STATS_FILE, stats)
+        _save(PASSWORDS_FILE, passwords)
         await call.message.answer(f"🗑 Пользователь {uid} удалён из базы.")
         await call.answer("Удалён")
 
@@ -632,9 +825,8 @@ async def cb_user_action(call: CallbackQuery):
 async def cb_subject(call: CallbackQuery):
     subj = call.data.split(":", 1)[1]
     user_subject[call.from_user.id] = subj
-    save_subjects()
+    _save(SUBJECTS_FILE, {str(k): v for k, v in user_subject.items()})
     name = SUBJECT_NAMES.get(subj, subj)
-    log.info("Пользователь %s выбрал режим: %s", call.from_user.id, subj)
     await call.message.edit_text(f"Режим: {name}\nКидай задачу.")
     await call.answer()
 
@@ -655,7 +847,6 @@ async def handle_mode_question(message: types.Message):
 async def handle_photo(message: types.Message):
     subj = user_subject.get(message.from_user.id, "general")
     mode_name = SUBJECT_NAMES.get(subj, subj)
-    log.info("handle_photo: user_id=%s, режим=%s", message.from_user.id, subj)
     await message.answer(f"Решаю... (режим: {mode_name})")
     try:
         photo = message.photo[-1]
@@ -690,8 +881,6 @@ async def handle_photo(message: types.Message):
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     subj = user_subject.get(message.from_user.id, "general")
-    log.info("handle_text: user_id=%s, режим=%s, текст=%r",
-             message.from_user.id, subj, message.text[:80])
     await bot.send_chat_action(message.chat.id, "typing")
     try:
         answer = await solve_text(message.text, subj)
