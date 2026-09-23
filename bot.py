@@ -217,15 +217,16 @@ class AuthMiddleware(BaseMiddleware):
         if user_id == ADMIN_ID:
             return await handler(event, data)
 
-        # Успешная оплата — всегда
-        if event.successful_payment:
+        # Успешная оплата — ВСЕГДА пропускаем
+        if event.successful_payment is not None:
+            log.info("MW: пропускаю successful_payment для %s", user_id)
             return await handler(event, data)
 
-        # Сервисные команды — всегда доступны
+        # Сервисные команды
         if event.text and event.text.startswith(("/start", "/support", "/mysub", "/buy", "/help")):
             return await handler(event, data)
 
-        # Открытый тикет — сообщение для поддержки
+        # Открытый тикет
         if event.text and get_open_ticket(user_id):
             return await handler(event, data)
 
@@ -234,7 +235,6 @@ class AuthMiddleware(BaseMiddleware):
             await event.answer("🚫 Ваш доступ заблокирован. Свяжитесь с продавцом.")
             return
 
-        # Проверка подписки
         status, expire_dt, days_left = get_subscription_status(user_id)
 
         if status == "active":
@@ -259,7 +259,6 @@ class AuthMiddleware(BaseMiddleware):
             )
             return
 
-        # Проверка пароля
         if event.text:
             pwd_key, pwd_info = find_password_by_value(event.text)
             if pwd_key:
@@ -322,6 +321,13 @@ def subject_kb():
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def buy_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Купить доступ за {PRICE_STARS} ⭐", callback_data="buy")],
+        [InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_start")],
+    ])
+
+
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔑 1 пароль", callback_data="admin:gen1"),
@@ -378,7 +384,8 @@ def admin_panel_text() -> str:
     )
 
 
-dp.message.middleware(AuthMiddleware())
+# ВАЖНО: outer_middleware — пропускает события до фильтров
+dp.message.outer_middleware(AuthMiddleware())
 
 
 # ============ КОМАНДЫ ============
@@ -388,20 +395,64 @@ async def cmd_start(message: types.Message):
         user_subject[message.from_user.id] = "general"
         _save(SUBJECTS_FILE, {str(k): v for k, v in user_subject.items()})
     touch_user(message.from_user)
-    current = SUBJECT_NAMES.get(user_subject[message.from_user.id], "💬 Общее")
+
+    # СТРАХОВКА: если была оплата, но доступ не применился — восстанавливаем
+    if message.from_user.id != ADMIN_ID:
+        status_check, _, _ = get_subscription_status(message.from_user.id)
+        if status_check in ("none", "expired"):
+            recovered = False
+            for charge_id, p in payments.items():
+                if (p.get("user_id") == message.from_user.id
+                        and p.get("status") == "paid"
+                        and not p.get("granted")):
+                    log.info("!!! Восстанавливаю доступ для %s по платежу %s",
+                             message.from_user.id, charge_id)
+                    extend_subscription(message.from_user.id)
+                    p["granted"] = True
+                    recovered = True
+            if recovered:
+                _save(PAYMENTS_FILE, payments)
+
+    # Админ
+    if message.from_user.id == ADMIN_ID:
+        current = SUBJECT_NAMES.get(user_subject[message.from_user.id], "💬 Общее")
+        await message.answer(
+            f"👑 Вы админ. Панель: /admin\n"
+            f"Текущий режим: {current}",
+            reply_markup=subject_kb(),
+        )
+        return
 
     status, expire_dt, days_left = get_subscription_status(message.from_user.id)
+
     if status == "active":
-        sub_line = f"\n💳 Подписка до {expire_dt.strftime('%d.%m.%Y')} ({days_left} дн.)"
-    elif status == "expired":
-        sub_line = f"\n⌛ Подписка истекла. Продлить — /buy"
-    else:
-        sub_line = ""
+        current = SUBJECT_NAMES.get(user_subject[message.from_user.id], "💬 Общее")
+        await message.answer(
+            f"Привет! Текущий режим: {current}\n"
+            f"💳 Подписка до {expire_dt.strftime('%d.%m.%Y')} ({days_left} дн.)\n"
+            f"Выбери предмет или сразу кидай задачу.",
+            reply_markup=subject_kb(),
+        )
+        return
+
+    if status == "expired":
+        await message.answer(
+            f"⌛ Ваша подписка истекла {expire_dt.strftime('%d.%m.%Y')}.\n\n"
+            f"Продлить доступ на {SUBSCRIPTION_DAYS} дней — {PRICE_STARS} ⭐.",
+            reply_markup=buy_kb(),
+        )
+        return
 
     await message.answer(
-        f"Привет! Текущий режим: {current}{sub_line}\n"
-        "Выбери предмет или сразу кидай задачу.",
-        reply_markup=subject_kb(),
+        f"👋 Привет!\n\n"
+        f"Это бот для решения домашних заданий по всем школьным предметам.\n\n"
+        f"📚 Что умеет:\n"
+        f"• Решает задачи по фото и тексту\n"
+        f"• Алгебра, геометрия, русский, история, физика и другие\n"
+        f"• Отвечает за 3-10 секунд\n\n"
+        f"💳 Подписка на {SUBSCRIPTION_DAYS} дней — {PRICE_STARS} ⭐\n\n"
+        f"Оформи подписку, чтобы начать:",
+        reply_markup=buy_kb(),
     )
 
 
@@ -419,6 +470,15 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("subject"))
 async def cmd_subject(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        status, _, _ = get_subscription_status(message.from_user.id)
+        if status != "active":
+            await message.answer(
+                "🔒 Смена предмета доступна только с активной подпиской.",
+                reply_markup=buy_kb(),
+            )
+            return
+
     current = user_subject.get(message.from_user.id, "general")
     current_name = SUBJECT_NAMES.get(current, "💬 Общее")
     await message.answer(f"Сейчас выбран: {current_name}\nВыбери новый:", reply_markup=subject_kb())
@@ -434,19 +494,13 @@ async def cmd_mysub(message: types.Message):
             f"⏰ Осталось: {days_left} дн."
         )
     elif status == "expired":
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 Продлить за {PRICE_STARS} ⭐", callback_data="buy")],
-        ])
         await message.answer(
             f"⌛ Ваша подписка истекла {expire_dt.strftime('%d.%m.%Y')}.\n"
             f"Продлить — {PRICE_STARS} ⭐.",
-            reply_markup=kb,
+            reply_markup=buy_kb(),
         )
     else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 Купить за {PRICE_STARS} ⭐", callback_data="buy")],
-        ])
-        await message.answer("У вас нет активной подписки.", reply_markup=kb)
+        await message.answer("У вас нет активной подписки.", reply_markup=buy_kb())
 
 
 @dp.message(Command("buy"))
@@ -496,51 +550,58 @@ async def send_stars_invoice(message: types.Message):
 
 @dp.pre_checkout_query()
 async def pre_checkout(query: PreCheckoutQuery):
+    log.info("PRE_CHECKOUT от %s, amount=%s", query.from_user.id, query.total_amount)
     await query.answer(ok=True)
 
 
 @dp.message(F.successful_payment)
 async def successful_payment(message: types.Message):
-    user = message.from_user
-    amount = message.successful_payment.total_amount
-    charge_id = message.successful_payment.provider_charge_id
-    payload = message.successful_payment.invoice_payload
-
-    log.info("Оплата %s ⭐ от %s (%s), charge=%s", amount, user.id, user.full_name, charge_id)
-
-    payments[charge_id] = {
-        "user_id": user.id,
-        "amount": amount,
-        "payload": payload,
-        "status": "paid",
-        "created": datetime.now().isoformat(timespec="seconds"),
-    }
-    _save(PAYMENTS_FILE, payments)
-
-    new_expire = extend_subscription(user.id)
-    touch_user(user)
-
-    log.info("Подписка юзера %s продлена до %s", user.id, new_expire)
-
-    await message.answer(
-        f"✅ Оплата получена! Подписка активна.\n\n"
-        f"📅 Действует до: {new_expire.strftime('%d.%m.%Y %H:%M')}\n"
-        f"⏰ Это {SUBSCRIPTION_DAYS} дней доступа.\n\n"
-        f"Проверить статус — /mysub",
-        reply_markup=subject_kb(),
-    )
-
     try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"💰 Новая оплата звёздами!\n"
-            f"👤 {user.full_name} (@{user.username or '—'})\n"
-            f"🆔 {user.id}\n"
-            f"⭐ {amount} звёзд\n"
-            f"📅 Подписка до: {new_expire.strftime('%d.%m.%Y')}",
+        user = message.from_user
+        amount = message.successful_payment.total_amount
+        charge_id = message.successful_payment.provider_charge_id
+        payload = message.successful_payment.invoice_payload
+
+        log.info("!!! SUCCESSFUL_PAYMENT: user=%s amount=%s charge=%s",
+                 user.id, amount, charge_id)
+
+        payments[charge_id] = {
+            "user_id": user.id,
+            "amount": amount,
+            "payload": payload,
+            "status": "paid",
+            "granted": True,
+            "created": datetime.now().isoformat(timespec="seconds"),
+        }
+        _save(PAYMENTS_FILE, payments)
+
+        new_expire = extend_subscription(user.id)
+        touch_user(user)
+
+        log.info("!!! Подписка юзера %s до %s", user.id, new_expire)
+
+        await message.answer(
+            f"✅ Оплата получена! Подписка активна.\n\n"
+            f"📅 Действует до: {new_expire.strftime('%d.%m.%Y %H:%M')}\n"
+            f"⏰ Это {SUBSCRIPTION_DAYS} дней доступа.\n\n"
+            f"Проверить статус — /mysub",
+            reply_markup=subject_kb(),
         )
+
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"💰 Новая оплата звёздами!\n"
+                f"👤 {user.full_name} (@{user.username or '—'})\n"
+                f"🆔 {user.id}\n"
+                f"⭐ {amount} звёзд\n"
+                f"📅 Подписка до: {new_expire.strftime('%d.%m.%Y')}",
+            )
+        except Exception as e:
+            log.warning("Не смог уведомить админа: %s", e)
     except Exception as e:
-        log.warning("Не смог уведомить админа: %s", e)
+        log.error("!!! ОШИБКА В SUCCESSFUL_PAYMENT: %s", e)
+        traceback.print_exc()
 
 
 @dp.message(Command("support"))
@@ -596,7 +657,7 @@ async def cmd_admin(message: types.Message):
     await message.answer(admin_panel_text(), reply_markup=admin_kb())
 
 
-# ============ ПОДДЕРЖКА: ПОЛЬЗОВАТЕЛЬ ПИШЕТ ============
+# ============ ПОДДЕРЖКА ============
 @dp.message(lambda m: m.from_user.id != ADMIN_ID
             and not (m.text or "").startswith("/")
             and (m.text or m.caption)
@@ -631,7 +692,6 @@ async def handle_support_message(message: types.Message):
     await message.answer("✅ Сообщение отправлено администратору. Ждите ответа.")
 
 
-# ============ АДМИН: ОТВЕТ НА ТИКЕТ ============
 @dp.callback_query(F.data.startswith("ticket:"))
 async def cb_ticket(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
@@ -687,7 +747,7 @@ async def handle_admin_ticket_reply(message: types.Message):
         await message.answer(f"❌ Не смог отправить: {e}")
 
 
-# ============ АДМИН: УДАЛЕНИЕ ПАРОЛЯ ПО ТЕКСТУ ============
+# ============ АДМИН: УДАЛЕНИЕ ПАРОЛЯ ============
 @dp.message(lambda m: m.from_user.id == ADMIN_ID
             and admin_states.get(ADMIN_ID) == "awaiting_password_to_delete"
             and m.text)
@@ -1020,6 +1080,12 @@ async def cb_user_action(call: CallbackQuery):
 # ============ CALLBACK: ВЫБОР ПРЕДМЕТА ============
 @dp.callback_query(F.data.startswith("subj:"))
 async def cb_subject(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        status, _, _ = get_subscription_status(call.from_user.id)
+        if status != "active":
+            await call.answer("🔒 Нужна подписка", show_alert=True)
+            return
+
     subj = call.data.split(":", 1)[1]
     user_subject[call.from_user.id] = subj
     _save(SUBJECTS_FILE, {str(k): v for k, v in user_subject.items()})
