@@ -97,8 +97,9 @@ blocked: set = set(_load(BLOCKED_FILE, []))
 tickets: dict = _load(TICKETS_FILE, {})
 payments: dict = _load(PAYMENTS_FILE, {})
 
-log.info("Загружено: подписок=%d, в статистике=%d, режимов=%d, паролей=%d, блок=%d, тикетов=%d",
-         len(authorized), len(stats), len(user_subject), len(passwords), len(blocked), len(tickets))
+log.info("Загружено: подписок=%d, в статистике=%d, режимов=%d, паролей=%d, блок=%d, тикетов=%d, платежей=%d",
+         len(authorized), len(stats), len(user_subject), len(passwords),
+         len(blocked), len(tickets), len(payments))
 
 
 def save_authorized():
@@ -186,6 +187,7 @@ def extend_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS) -> datetime
         new_expire = now + timedelta(days=days)
     authorized[user_id] = new_expire.isoformat(timespec="seconds")
     save_authorized()
+    log.info("extend_subscription: user=%s new_expire=%s", user_id, new_expire)
     return new_expire
 
 
@@ -213,24 +215,25 @@ class AuthMiddleware(BaseMiddleware):
             return await handler(event, data)
         user_id = event.from_user.id
 
-        # Админ — всегда
+        # ДИАГНОСТИКА: логируем каждый входящий Message
+        log.info("MW: user=%s text=%r payment=%s",
+                 user_id,
+                 (event.text or event.caption or "")[:40],
+                 bool(event.successful_payment))
+
         if user_id == ADMIN_ID:
             return await handler(event, data)
 
-        # Успешная оплата — ВСЕГДА пропускаем
         if event.successful_payment is not None:
-            log.info("MW: пропускаю successful_payment для %s", user_id)
+            log.info("MW: пропускаю successful_payment")
             return await handler(event, data)
 
-        # Сервисные команды
         if event.text and event.text.startswith(("/start", "/support", "/mysub", "/buy", "/help")):
             return await handler(event, data)
 
-        # Открытый тикет
         if event.text and get_open_ticket(user_id):
             return await handler(event, data)
 
-        # Заблокированные
         if user_id in blocked:
             await event.answer("🚫 Ваш доступ заблокирован. Свяжитесь с продавцом.")
             return
@@ -338,7 +341,8 @@ def admin_kb():
          InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
         [InlineKeyboardButton(text="💳 Подписки", callback_data="admin:subs"),
          InlineKeyboardButton(text="🎫 Тикеты", callback_data="admin:tickets")],
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh")],
+        [InlineKeyboardButton(text="➕ Добавить юзера", callback_data="admin:add_user"),
+         InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh")],
     ])
 
 
@@ -384,36 +388,19 @@ def admin_panel_text() -> str:
     )
 
 
-# ВАЖНО: outer_middleware — пропускает события до фильтров
 dp.message.outer_middleware(AuthMiddleware())
 
 
 # ============ КОМАНДЫ ============
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    log.info("cmd_start: user=%s (%s)", message.from_user.id, message.from_user.full_name)
+
     if message.from_user.id not in user_subject:
         user_subject[message.from_user.id] = "general"
         _save(SUBJECTS_FILE, {str(k): v for k, v in user_subject.items()})
     touch_user(message.from_user)
 
-    # СТРАХОВКА: если была оплата, но доступ не применился — восстанавливаем
-    if message.from_user.id != ADMIN_ID:
-        status_check, _, _ = get_subscription_status(message.from_user.id)
-        if status_check in ("none", "expired"):
-            recovered = False
-            for charge_id, p in payments.items():
-                if (p.get("user_id") == message.from_user.id
-                        and p.get("status") == "paid"
-                        and not p.get("granted")):
-                    log.info("!!! Восстанавливаю доступ для %s по платежу %s",
-                             message.from_user.id, charge_id)
-                    extend_subscription(message.from_user.id)
-                    p["granted"] = True
-                    recovered = True
-            if recovered:
-                _save(PAYMENTS_FILE, payments)
-
-    # Админ
     if message.from_user.id == ADMIN_ID:
         current = SUBJECT_NAMES.get(user_subject[message.from_user.id], "💬 Общее")
         await message.answer(
@@ -424,6 +411,7 @@ async def cmd_start(message: types.Message):
         return
 
     status, expire_dt, days_left = get_subscription_status(message.from_user.id)
+    log.info("cmd_start: user=%s status=%s", message.from_user.id, status)
 
     if status == "active":
         current = SUBJECT_NAMES.get(user_subject[message.from_user.id], "💬 Общее")
@@ -478,7 +466,6 @@ async def cmd_subject(message: types.Message):
                 reply_markup=buy_kb(),
             )
             return
-
     current = user_subject.get(message.from_user.id, "general")
     current_name = SUBJECT_NAMES.get(current, "💬 Общее")
     await message.answer(f"Сейчас выбран: {current_name}\nВыбери новый:", reply_markup=subject_kb())
@@ -505,11 +492,13 @@ async def cmd_mysub(message: types.Message):
 
 @dp.message(Command("buy"))
 async def cmd_buy(message: types.Message):
+    log.info("cmd_buy: user=%s", message.from_user.id)
     await send_stars_invoice(message)
 
 
 @dp.callback_query(F.data == "buy")
 async def cb_buy(call: CallbackQuery):
+    log.info("cb_buy: user=%s", call.from_user.id)
     await send_stars_invoice(call.message)
     await call.answer()
 
@@ -525,10 +514,7 @@ async def send_stars_invoice(message: types.Message):
         )
     else:
         title = "Подписка на ФоксФорд ГДЗ"
-        description = (
-            f"Доступ к боту на {SUBSCRIPTION_DAYS} дней.\n"
-            f"После оплаты получите доступ ко всем предметам."
-        )
+        description = f"Доступ к боту на {SUBSCRIPTION_DAYS} дней."
 
     try:
         await bot.send_invoice(
@@ -541,7 +527,7 @@ async def send_stars_invoice(message: types.Message):
             prices=[LabeledPrice(label=f"Подписка на {SUBSCRIPTION_DAYS} дней", amount=PRICE_STARS)],
             start_parameter="buy_subscription",
         )
-        log.info("Отправлен счёт на %d ⭐ юзеру %s", PRICE_STARS, message.from_user.id)
+        log.info("send_stars_invoice: счёт отправлен юзеру %s", message.from_user.id)
     except Exception as e:
         log.error("Ошибка отправки счёта: %s", e)
         traceback.print_exc()
@@ -550,7 +536,8 @@ async def send_stars_invoice(message: types.Message):
 
 @dp.pre_checkout_query()
 async def pre_checkout(query: PreCheckoutQuery):
-    log.info("PRE_CHECKOUT от %s, amount=%s", query.from_user.id, query.total_amount)
+    log.info("!!! PRE_CHECKOUT: user=%s amount=%s payload=%s",
+             query.from_user.id, query.total_amount, query.invoice_payload)
     await query.answer(ok=True)
 
 
@@ -613,7 +600,6 @@ async def cmd_support(message: types.Message):
             f"Напишите ваше сообщение — я передам администратору."
         )
         return
-
     tid = create_ticket(
         user_id=message.from_user.id,
         username=message.from_user.username or message.from_user.full_name,
@@ -621,8 +607,7 @@ async def cmd_support(message: types.Message):
     )
     await message.answer(
         f"🆘 Тикет #{tid} создан.\n\n"
-        f"Напишите ваш вопрос следующим сообщением — я передам его администратору.\n"
-        f"Ответ придёт сюда же, в этот чат."
+        f"Напишите ваш вопрос следующим сообщением — я передам его администратору."
     )
 
 
@@ -636,7 +621,6 @@ async def cb_support_start(call: CallbackQuery):
         )
         await call.answer()
         return
-
     tid = create_ticket(
         user_id=call.from_user.id,
         username=call.from_user.username or call.from_user.full_name,
@@ -657,6 +641,49 @@ async def cmd_admin(message: types.Message):
     await message.answer(admin_panel_text(), reply_markup=admin_kb())
 
 
+# ============ АДМИН: РУЧНОЕ ДОБАВЛЕНИЕ ЮЗЕРА ============
+@dp.callback_query(F.data == "admin:add_user")
+async def cb_add_user(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔", show_alert=True)
+        return
+    admin_states[ADMIN_ID] = "awaiting_user_id_to_add"
+    await call.message.answer(
+        "➕ Отправь **Telegram ID** пользователя, которому нужно выдать доступ на "
+        f"{SUBSCRIPTION_DAYS} дней.\n\n"
+        "Узнать ID: пусть напишет @userinfobot",
+        parse_mode="Markdown",
+    )
+    await call.answer()
+
+
+@dp.message(lambda m: m.from_user.id == ADMIN_ID
+            and admin_states.get(ADMIN_ID) == "awaiting_user_id_to_add"
+            and m.text)
+async def handle_add_user(message: types.Message):
+    admin_states.pop(ADMIN_ID, None)
+    text = (message.text or "").strip()
+    try:
+        uid = int(text)
+    except ValueError:
+        await message.answer("❌ Это не похоже на ID. Отправь число.")
+        return
+    new_expire = extend_subscription(uid, SUBSCRIPTION_DAYS)
+    await message.answer(
+        f"✅ Пользователю {uid} выдан доступ на {SUBSCRIPTION_DAYS} дней.\n"
+        f"📅 До: {new_expire.strftime('%d.%m.%Y %H:%M')}"
+    )
+    try:
+        await bot.send_message(
+            uid,
+            f"🎁 Администратор выдал вам доступ на {SUBSCRIPTION_DAYS} дней!\n"
+            f"📅 До: {new_expire.strftime('%d.%m.%Y')}\n\n"
+            f"Открой /start, чтобы начать."
+        )
+    except Exception as e:
+        log.warning("Не смог уведомить %s: %s", uid, e)
+
+
 # ============ ПОДДЕРЖКА ============
 @dp.message(lambda m: m.from_user.id != ADMIN_ID
             and not (m.text or "").startswith("/")
@@ -666,15 +693,12 @@ async def handle_support_message(message: types.Message):
     tid = get_open_ticket(message.from_user.id)
     if not tid:
         return
-
     text = message.text or message.caption or "[медиа]"
     tickets[tid]["messages"].append({
-        "from": "user",
-        "text": text,
+        "from": "user", "text": text,
         "time": datetime.now().isoformat(timespec="seconds"),
     })
     _save(TICKETS_FILE, tickets)
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Ответить", callback_data=f"ticket:reply:{tid}")],
         [InlineKeyboardButton(text="✅ Закрыть тикет", callback_data=f"ticket:close:{tid}")],
@@ -688,7 +712,6 @@ async def handle_support_message(message: types.Message):
         )
     except Exception as e:
         log.warning("Не смог уведомить админа: %s", e)
-
     await message.answer("✅ Сообщение отправлено администратору. Ждите ответа.")
 
 
@@ -697,26 +720,21 @@ async def cb_ticket(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         await call.answer("⛔", show_alert=True)
         return
-
     parts = call.data.split(":")
-    action = parts[1]
-    tid = parts[2]
-
+    action, tid = parts[1], parts[2]
     if tid not in tickets:
         await call.answer("Тикет не найден", show_alert=True)
         return
-
     if action == "reply":
         admin_states[ADMIN_ID] = f"reply_ticket:{tid}"
         await call.message.answer(f"✏️ Напиши ответ для тикета {tid}:")
         await call.answer()
-
     elif action == "close":
         tickets[tid]["status"] = "closed"
         _save(TICKETS_FILE, tickets)
         uid = tickets[tid]["user_id"]
         try:
-            await bot.send_message(uid, "✅ Ваш тикет закрыт. Если появятся новые вопросы — /support.")
+            await bot.send_message(uid, "✅ Ваш тикет закрыт. Если появятся вопросы — /support.")
         except Exception:
             pass
         await call.message.answer(f"🎫 Тикет {tid} закрыт.")
@@ -731,14 +749,12 @@ async def handle_admin_ticket_reply(message: types.Message):
     if tid not in tickets:
         await message.answer("Тикет не найден.")
         return
-
     reply_text = message.text or "[пусто]"
     tickets[tid]["messages"].append({
         "from": "admin", "text": reply_text,
         "time": datetime.now().isoformat(timespec="seconds"),
     })
     _save(TICKETS_FILE, tickets)
-
     uid = tickets[tid]["user_id"]
     try:
         await bot.send_message(uid, f"📨 Ответ поддержки:\n\n{reply_text}")
@@ -747,7 +763,6 @@ async def handle_admin_ticket_reply(message: types.Message):
         await message.answer(f"❌ Не смог отправить: {e}")
 
 
-# ============ АДМИН: УДАЛЕНИЕ ПАРОЛЯ ============
 @dp.message(lambda m: m.from_user.id == ADMIN_ID
             and admin_states.get(ADMIN_ID) == "awaiting_password_to_delete"
             and m.text)
@@ -769,7 +784,6 @@ async def cb_admin(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         await call.answer("⛔", show_alert=True)
         return
-
     action = call.data.split(":", 1)[1]
 
     if action == "gen1":
@@ -780,7 +794,7 @@ async def cb_admin(call: CallbackQuery):
                           "used_by": None, "used_at": None, "note": ""}
         _save(PASSWORDS_FILE, passwords)
         await call.message.answer(
-            f"🔑 Новый пароль:\n\n`{pwd}`\n\nПри активации даёт {SUBSCRIPTION_DAYS} дней доступа.",
+            f"🔑 Новый пароль:\n\n`{pwd}`\n\nДаёт {SUBSCRIPTION_DAYS} дней доступа.",
             parse_mode="Markdown",
         )
         await call.answer("Создан")
@@ -796,7 +810,7 @@ async def cb_admin(call: CallbackQuery):
             new_pwds.append(pwd)
         _save(PASSWORDS_FILE, passwords)
         await call.message.answer(
-            f"🔑 5 новых паролей (каждый = {SUBSCRIPTION_DAYS} дней):\n\n"
+            f"🔑 5 паролей (каждый = {SUBSCRIPTION_DAYS} дней):\n\n"
             + "\n".join(f"`{p}`" for p in new_pwds),
             parse_mode="Markdown",
         )
@@ -834,7 +848,7 @@ async def cb_admin(call: CallbackQuery):
 
     elif action == "del_one":
         admin_states[ADMIN_ID] = "awaiting_password_to_delete"
-        await call.message.answer("Отправь пароль, который нужно удалить:")
+        await call.message.answer("Отправь пароль для удаления:")
         await call.answer()
 
     elif action == "del_free":
@@ -842,16 +856,15 @@ async def cb_admin(call: CallbackQuery):
         for p in free:
             del passwords[p]
         _save(PASSWORDS_FILE, passwords)
-        await call.message.answer(f"🗑 Удалено свободных паролей: {len(free)}")
+        await call.message.answer(f"🗑 Удалено свободных: {len(free)}")
         await call.answer()
 
     elif action == "del_used":
         used = [(p, v) for p, v in passwords.items() if v.get("used_by")]
-        count = len(used)
         for p, v in used:
             del passwords[p]
         _save(PASSWORDS_FILE, passwords)
-        await call.message.answer(f"🗑 Удалено использованных паролей: {count}")
+        await call.message.answer(f"🗑 Удалено использованных: {len(used)}")
         await call.answer()
 
     elif action == "stats":
@@ -862,17 +875,17 @@ async def cb_admin(call: CallbackQuery):
         paid = [p for p in payments.values() if p.get("status") == "paid"]
         total_stars = sum(p.get("amount", 0) for p in paid)
         lines = [
-            "📊 Статистика бота",
+            "📊 Статистика",
             "",
-            f"🔑 Паролей: {len(passwords)} (использовано {used_pwd})",
+            f"🔑 Паролей: {len(passwords)} (исп. {used_pwd})",
             f"💳 Подписок: {len(authorized)}",
-            f"🚫 Заблокированных: {len(blocked)}",
+            f"🚫 Заблокировано: {len(blocked)}",
             f"💰 Оплат: {len(paid)} на {total_stars} ⭐",
-            f"✅ Всего задач: {total_tasks}",
+            f"✅ Задач: {total_tasks}",
             f"   📝 текстом: {total_texts}",
             f"   📷 фото: {total_photos}",
             "",
-            "📋 Топ-10 по задачам:",
+            "📋 Топ-10:",
         ]
         sorted_users = sorted(stats.items(), key=lambda x: x[1].get("tasks", 0), reverse=True)[:10]
         for i, (uid, s) in enumerate(sorted_users, 1):
@@ -894,10 +907,7 @@ async def cb_admin(call: CallbackQuery):
                 days = (exp_dt - now).days
                 s = stats.get(str(uid), {})
                 uname = s.get("username", "?")
-                if exp_dt > now:
-                    items.append((exp_dt, uid, uname, days, "✅"))
-                else:
-                    items.append((exp_dt, uid, uname, days, "⌛"))
+                items.append((exp_dt, uid, uname, days, "✅" if exp_dt > now else "⌛"))
             except Exception:
                 pass
         items.sort(reverse=True)
@@ -974,10 +984,8 @@ async def cb_user_action(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         await call.answer("⛔", show_alert=True)
         return
-
     parts = call.data.split(":")
-    action = parts[1]
-    uid = int(parts[2])
+    action, uid = parts[1], int(parts[2])
 
     if action == "info":
         s = stats.get(str(uid), {})
@@ -990,8 +998,8 @@ async def cb_user_action(call: CallbackQuery):
         last_seen = s.get("last_seen", "?")[:10]
         pwd = user_has_password_activated(uid) or "нет"
         is_blocked = uid in blocked
-
         status, expire_dt, days_left = get_subscription_status(uid)
+
         if is_blocked:
             status_txt = "🚫 ЗАБЛОКИРОВАН"
             exp_txt = "—"
@@ -1007,15 +1015,10 @@ async def cb_user_action(call: CallbackQuery):
 
         text = (
             f"👤 Пользователь\n\n"
-            f"ID: {uid}\n"
-            f"Имя: {full_name}\n"
-            f"Username: @{uname}\n"
-            f"Статус: {status_txt}\n"
-            f"Подписка до: {exp_txt}\n"
-            f"Пароль: {pwd}\n\n"
+            f"ID: {uid}\nИмя: {full_name}\nUsername: @{uname}\n"
+            f"Статус: {status_txt}\nПодписка до: {exp_txt}\nПароль: {pwd}\n\n"
             f"📊 Задач: {tasks} (текст {texts}, фото {photos})\n"
-            f"Первый раз: {first_seen}\n"
-            f"Последний: {last_seen}"
+            f"Первый раз: {first_seen}\nПоследний: {last_seen}"
         )
 
         buttons = []
@@ -1027,9 +1030,8 @@ async def cb_user_action(call: CallbackQuery):
         buttons.append(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"usr:delete:{uid}"))
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            buttons[:2],
-            buttons[2:],
-            [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="admin:users")],
+            buttons[:2], buttons[2:],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:users")],
         ])
         await call.message.answer(text, reply_markup=kb)
         await call.answer()
@@ -1037,27 +1039,23 @@ async def cb_user_action(call: CallbackQuery):
     elif action == "block":
         blocked.add(uid)
         _save(BLOCKED_FILE, list(blocked))
-        await call.message.answer(f"🚫 Пользователь {uid} заблокирован.")
+        await call.message.answer(f"🚫 {uid} заблокирован.")
         await call.answer("Заблокирован")
 
     elif action == "unblock":
         blocked.discard(uid)
         _save(BLOCKED_FILE, list(blocked))
-        await call.message.answer(f"✅ Пользователь {uid} разблокирован.")
+        await call.message.answer(f"✅ {uid} разблокирован.")
         await call.answer("Разблокирован")
 
     elif action == "extend":
         new_expire = extend_subscription(uid, SUBSCRIPTION_DAYS)
         await call.message.answer(
-            f"🎁 Подписка юзера {uid} продлена на {SUBSCRIPTION_DAYS} дней.\n"
-            f"📅 До: {new_expire.strftime('%d.%m.%Y')}"
+            f"🎁 {uid} продлён на {SUBSCRIPTION_DAYS} дней. До: {new_expire.strftime('%d.%m.%Y')}"
         )
         try:
-            await bot.send_message(
-                uid,
-                f"🎁 Ваша подписка продлена администратором на {SUBSCRIPTION_DAYS} дней.\n"
-                f"📅 До: {new_expire.strftime('%d.%m.%Y')}"
-            )
+            await bot.send_message(uid,
+                f"🎁 Подписка продлена на {SUBSCRIPTION_DAYS} дней.\n📅 До: {new_expire.strftime('%d.%m.%Y')}")
         except Exception:
             pass
         await call.answer("Продлено")
@@ -1073,7 +1071,7 @@ async def cb_user_action(call: CallbackQuery):
         _save(BLOCKED_FILE, list(blocked))
         _save(STATS_FILE, stats)
         _save(PASSWORDS_FILE, passwords)
-        await call.message.answer(f"🗑 Пользователь {uid} удалён.")
+        await call.message.answer(f"🗑 {uid} удалён.")
         await call.answer("Удалён")
 
 
@@ -1085,7 +1083,6 @@ async def cb_subject(call: CallbackQuery):
         if status != "active":
             await call.answer("🔒 Нужна подписка", show_alert=True)
             return
-
     subj = call.data.split(":", 1)[1]
     user_subject[call.from_user.id] = subj
     _save(SUBJECTS_FILE, {str(k): v for k, v in user_subject.items()})
