@@ -215,7 +215,6 @@ class AuthMiddleware(BaseMiddleware):
             return await handler(event, data)
         user_id = event.from_user.id
 
-        # ДИАГНОСТИКА: логируем каждый входящий Message
         log.info("MW: user=%s text=%r payment=%s",
                  user_id,
                  (event.text or event.caption or "")[:40],
@@ -541,13 +540,21 @@ async def pre_checkout(query: PreCheckoutQuery):
     await query.answer(ok=True)
 
 
+# ============ УСПЕШНАЯ ОПЛАТА (ИСПРАВЛЕНО) ============
 @dp.message(F.successful_payment)
 async def successful_payment(message: types.Message):
     try:
         user = message.from_user
-        amount = message.successful_payment.total_amount
-        charge_id = message.successful_payment.provider_charge_id
-        payload = message.successful_payment.invoice_payload
+        sp = message.successful_payment
+        amount = sp.total_amount
+
+        # Для Stars — telegram_payment_charge_id, для обычных провайдеров — provider_charge_id
+        charge_id = (
+            getattr(sp, "telegram_payment_charge_id", None)
+            or getattr(sp, "provider_charge_id", None)
+            or sp.invoice_payload
+            or f"stars_{user.id}_{int(datetime.now().timestamp())}"
+        )
 
         log.info("!!! SUCCESSFUL_PAYMENT: user=%s amount=%s charge=%s",
                  user.id, amount, charge_id)
@@ -555,7 +562,7 @@ async def successful_payment(message: types.Message):
         payments[charge_id] = {
             "user_id": user.id,
             "amount": amount,
-            "payload": payload,
+            "payload": sp.invoice_payload,
             "status": "paid",
             "granted": True,
             "created": datetime.now().isoformat(timespec="seconds"),
@@ -641,7 +648,7 @@ async def cmd_admin(message: types.Message):
     await message.answer(admin_panel_text(), reply_markup=admin_kb())
 
 
-# ============ АДМИН: РУЧНОЕ ДОБАВЛЕНИЕ ЮЗЕРА ============
+# ============ АДМИН: РУЧНОЕ ДОБАВЛЕНИЕ ============
 @dp.callback_query(F.data == "admin:add_user")
 async def cb_add_user(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
