@@ -4,6 +4,8 @@ import json
 import os
 import re
 import logging
+import secrets
+import string
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -33,7 +35,6 @@ TELEGRAM_TOKEN = (
     or ""
 ).strip()
 
-BOT_PASSWORD = "3008"
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6112132988"))
 
 log.info("TELEGRAM_TOKEN найден: %s", bool(TELEGRAM_TOKEN))
@@ -52,6 +53,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AUTHORIZED_FILE = DATA_DIR / "authorized.json"
 STATS_FILE = DATA_DIR / "stats.json"
 SUBJECTS_FILE = DATA_DIR / "subjects.json"
+PASSWORDS_FILE = DATA_DIR / "passwords.json"
 
 
 def _load(path, default):
@@ -73,9 +75,11 @@ def _save(path, data):
 authorized: set = set(_load(AUTHORIZED_FILE, []))
 stats: dict = _load(STATS_FILE, {})
 user_subject: dict = {int(k): v for k, v in _load(SUBJECTS_FILE, {}).items()}
+# Структура passwords: {"XXXX-XXXX": {"created": ..., "used_by": null, "used_at": null, "note": ""}}
+passwords: dict = _load(PASSWORDS_FILE, {})
 
-log.info("Загружено: авторизованных=%d, в статистике=%d, режимов=%d",
-         len(authorized), len(stats), len(user_subject))
+log.info("Загружено: авторизованных=%d, в статистике=%d, режимов=%d, паролей=%d",
+         len(authorized), len(stats), len(user_subject), len(passwords))
 
 
 def save_authorized():
@@ -90,8 +94,11 @@ def save_subjects():
     _save(SUBJECTS_FILE, {str(k): v for k, v in user_subject.items()})
 
 
+def save_passwords():
+    _save(PASSWORDS_FILE, passwords)
+
+
 def touch_user(user, task_type=None):
-    """Обновляет статистику по пользователю."""
     uid = str(user.id)
     now = datetime.now().isoformat(timespec="seconds")
     if uid not in stats:
@@ -115,32 +122,90 @@ def touch_user(user, task_type=None):
     save_stats()
 
 
+def generate_password(prefix: str = "") -> str:
+    """Генерирует пароль вида 'XXXX-XXXX-XXXX' или 'PREFIX-XXXX'."""
+    alphabet = string.ascii_uppercase + string.digits
+    # Убираем похожие символы (0/O, 1/I)
+    alphabet = alphabet.replace("O", "").replace("0", "").replace("I", "").replace("1", "")
+    if prefix:
+        prefix = re.sub(r"[^A-Z0-9]", "", prefix.upper())[:8]
+        part = "".join(secrets.choice(alphabet) for _ in range(4))
+        return f"{prefix}-{part}"
+    parts = ["".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3)]
+    return "-".join(parts)
+
+
+def find_password_by_value(value: str):
+    """Ищет пароль в базе (регистронезависимо)."""
+    value = value.strip().upper()
+    for pwd, info in passwords.items():
+        if pwd.upper() == value:
+            return pwd, info
+    return None, None
+
+
+def user_has_password_activated(user_id: int) -> str | None:
+    """Если юзер уже активировал какой-то пароль, возвращает его."""
+    for pwd, info in passwords.items():
+        if info.get("used_by") == user_id:
+            return pwd
+    return None
+
+
 # ============ АУТЕНТИФИКАЦИЯ ============
 class AuthMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if not isinstance(event, types.Message):
             return await handler(event, data)
         user_id = event.from_user.id
-        # Админ всегда проходит
+
         if user_id == ADMIN_ID:
             return await handler(event, data)
-        # Уже авторизован
+
         if user_id in authorized:
             return await handler(event, data)
-        # Проверка пароля
-        if event.text and event.text.strip() == BOT_PASSWORD:
-            authorized.add(user_id)
-            save_authorized()
-            touch_user(event.from_user)
-            log.info("Новый пользователь авторизован: %s", user_id)
-            await event.answer(
-                "✅ Пароль верный! Добро пожаловать.\n"
-                "Выбери предмет и кинь задачу.",
-                reply_markup=subject_kb(),
-            )
-            return
-        # Не авторизован — просим пароль
-        await event.answer("🔒 Введи пароль для доступа к боту:")
+
+        # Проверяем, не пароль ли ввёл
+        if event.text:
+            pwd_key, pwd_info = find_password_by_value(event.text)
+            if pwd_key:
+                # Пароль существует
+                if pwd_info.get("used_by") is None:
+                    # Свободен — активируем
+                    pwd_info["used_by"] = user_id
+                    pwd_info["used_at"] = datetime.now().isoformat(timespec="seconds")
+                    pwd_info["used_by_name"] = event.from_user.full_name
+                    pwd_info["used_by_username"] = event.from_user.username or ""
+                    save_passwords()
+                    authorized.add(user_id)
+                    save_authorized()
+                    touch_user(event.from_user)
+                    log.info("Пароль %s активирован юзером %s (%s)",
+                             pwd_key, user_id, event.from_user.full_name)
+                    await event.answer(
+                        "✅ Пароль активирован! Добро пожаловать.\n"
+                        "Выбери предмет и кинь задачу.",
+                        reply_markup=subject_kb(),
+                    )
+                    return
+                elif pwd_info.get("used_by") == user_id:
+                    # Странная ситуация — этот же юзер, но не в authorized
+                    authorized.add(user_id)
+                    save_authorized()
+                    await event.answer("✅ Доступ восстановлен. Выбери предмет.")
+                    return
+                else:
+                    log.info("Попытка использовать занятый пароль %s юзером %s", pwd_key, user_id)
+                    await event.answer(
+                        "❌ Этот пароль уже активирован другим пользователем.\n"
+                        "Если вы купили пароль — напишите продавцу."
+                    )
+                    return
+
+        await event.answer(
+            "🔒 Введи пароль для доступа к боту.\n"
+            "Если у тебя нет пароля — напиши продавцу."
+        )
 
 
 # ============ МЕНЮ ============
@@ -179,7 +244,23 @@ def subject_kb():
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# Подключаем middleware ко всем сообщениям
+def admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔑 Сгенерировать 1", callback_data="admin:gen1"),
+            InlineKeyboardButton(text="🔑🔑 5 паролей", callback_data="admin:gen5"),
+        ],
+        [
+            InlineKeyboardButton(text="📋 Список паролей", callback_data="admin:list"),
+            InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats"),
+        ],
+        [
+            InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"),
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:refresh"),
+        ],
+    ])
+
+
 dp.message.middleware(AuthMiddleware())
 
 
@@ -208,54 +289,154 @@ async def cmd_subject(message: types.Message):
     )
 
 
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
     if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Команда только для администратора.")
+        await message.answer("⛔ Только для администратора.")
         return
-    total_tasks = sum(s.get("tasks", 0) for s in stats.values())
-    total_texts = sum(s.get("texts", 0) for s in stats.values())
-    total_photos = sum(s.get("photos", 0) for s in stats.values())
-    lines = [
-        "📊 Статистика бота",
-        "",
-        f"👥 Авторизованных: {len(authorized)}",
-        f"👥 Всего в базе: {len(stats)}",
-        f"✅ Всего задач: {total_tasks}",
-        f"   📝 текстом: {total_texts}",
-        f"   📷 фото: {total_photos}",
-        "",
-        "📋 Топ-10 по задачам:",
-    ]
-    sorted_users = sorted(stats.items(), key=lambda x: x[1].get("tasks", 0), reverse=True)[:10]
-    for i, (uid, s) in enumerate(sorted_users, 1):
-        uname = s.get("username", "?")
-        lines.append(f"{i}. @{uname} (id {uid}): {s.get('tasks', 0)} задач")
-    await message.answer("\n".join(lines))
+    total_pwd = len(passwords)
+    used_pwd = sum(1 for v in passwords.values() if v.get("used_by"))
+    free_pwd = total_pwd - used_pwd
+    await message.answer(
+        f"🎛 Админ-панель\n\n"
+        f"🔑 Паролей всего: {total_pwd}\n"
+        f"✅ Использовано: {used_pwd}\n"
+        f"🆓 Свободных: {free_pwd}",
+        reply_markup=admin_kb(),
+    )
 
 
-@dp.message(Command("users"))
-async def cmd_users(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ Команда только для администратора.")
+# ============ CALLBACK: АДМИН-ПАНЕЛЬ ============
+@dp.callback_query(F.data.startswith("admin:"))
+async def cb_admin(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("⛔ Только для админа", show_alert=True)
         return
-    if not stats:
-        await message.answer("Пока никто не пользовался ботом.")
-        return
-    lines = ["📋 Все пользователи:"]
-    for uid, s in stats.items():
-        is_auth = int(uid) in authorized or int(uid) == ADMIN_ID
-        status = "✅" if is_auth else "❌"
-        uname = s.get("username", "?")
-        last = s.get("last_seen", "?")[:10]
-        lines.append(
-            f"{status} @{uname} (id {uid}) — {s.get('tasks', 0)} задач, "
-            f"последний: {last}"
+
+    action = call.data.split(":", 1)[1]
+
+    if action == "gen1":
+        pwd = generate_password()
+        while pwd in passwords:
+            pwd = generate_password()
+        passwords[pwd] = {
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "used_by": None,
+            "used_at": None,
+            "note": "",
+        }
+        save_passwords()
+        await call.message.answer(
+            f"🔑 Новый пароль:\n\n`{pwd}`\n\n"
+            f"Скопируй и продай покупателю. Активируется один раз.",
+            parse_mode="Markdown",
         )
-    await message.answer("\n".join(lines))
+        await call.answer("Пароль создан")
+
+    elif action == "gen5":
+        new_pwds = []
+        for _ in range(5):
+            pwd = generate_password()
+            while pwd in passwords:
+                pwd = generate_password()
+            passwords[pwd] = {
+                "created": datetime.now().isoformat(timespec="seconds"),
+                "used_by": None,
+                "used_at": None,
+                "note": "",
+            }
+            new_pwds.append(pwd)
+        save_passwords()
+        text = "🔑 5 новых паролей:\n\n" + "\n".join(f"`{p}`" for p in new_pwds)
+        await call.message.answer(text, parse_mode="Markdown")
+        await call.answer("Создано 5 паролей")
+
+    elif action == "list":
+        if not passwords:
+            await call.message.answer("Паролей пока нет. Нажми «Сгенерировать».")
+            await call.answer()
+            return
+        lines = ["📋 Список паролей:\n"]
+        free = [p for p, v in passwords.items() if not v.get("used_by")]
+        used = [(p, v) for p, v in passwords.items() if v.get("used_by")]
+        if free:
+            lines.append(f"🆓 Свободные ({len(free)}):")
+            for p in free:
+                lines.append(f"   `{p}`")
+            lines.append("")
+        if used:
+            lines.append(f"✅ Использованные ({len(used)}):")
+            for p, v in used:
+                name = v.get("used_by_name", "?")
+                uname = v.get("used_by_username", "")
+                uname_str = f" @{uname}" if uname else ""
+                lines.append(f"   `{p}` → {name}{uname_str}")
+        text = "\n".join(lines)
+        # Обрезаем если слишком длинно
+        if len(text) > 4000:
+            text = text[:4000] + "\n... (обрезано)"
+        await call.message.answer(text, parse_mode="Markdown")
+        await call.answer()
+
+    elif action == "stats":
+        total_tasks = sum(s.get("tasks", 0) for s in stats.values())
+        total_texts = sum(s.get("texts", 0) for s in stats.values())
+        total_photos = sum(s.get("photos", 0) for s in stats.values())
+        used_pwd = sum(1 for v in passwords.values() if v.get("used_by"))
+        lines = [
+            "📊 Статистика бота",
+            "",
+            f"🔑 Паролей: {len(passwords)} (использовано {used_pwd})",
+            f"👥 Авторизованных: {len(authorized)}",
+            f"✅ Всего задач: {total_tasks}",
+            f"   📝 текстом: {total_texts}",
+            f"   📷 фото: {total_photos}",
+            "",
+            "📋 Топ-10 по задачам:",
+        ]
+        sorted_users = sorted(stats.items(), key=lambda x: x[1].get("tasks", 0), reverse=True)[:10]
+        for i, (uid, s) in enumerate(sorted_users, 1):
+            uname = s.get("username", "?")
+            lines.append(f"{i}. @{uname} (id {uid}): {s.get('tasks', 0)} задач")
+        await call.message.answer("\n".join(lines))
+        await call.answer()
+
+    elif action == "users":
+        if not stats:
+            await call.message.answer("Пока никто не пользовался ботом.")
+            await call.answer()
+            return
+        lines = ["📋 Все пользователи:"]
+        for uid, s in stats.items():
+            is_auth = int(uid) in authorized or int(uid) == ADMIN_ID
+            status = "✅" if is_auth else "❌"
+            uname = s.get("username", "?")
+            last = s.get("last_seen", "?")[:10]
+            lines.append(
+                f"{status} @{uname} (id {uid}) — {s.get('tasks', 0)} задач, "
+                f"последний: {last}"
+            )
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "\n... (обрезано)"
+        await call.message.answer(text)
+        await call.answer()
+
+    elif action == "refresh":
+        total_pwd = len(passwords)
+        used_pwd = sum(1 for v in passwords.values() if v.get("used_by"))
+        free_pwd = total_pwd - used_pwd
+        await call.message.edit_text(
+            f"🎛 Админ-панель\n\n"
+            f"🔑 Паролей всего: {total_pwd}\n"
+            f"✅ Использовано: {used_pwd}\n"
+            f"🆓 Свободных: {free_pwd}",
+            reply_markup=admin_kb(),
+        )
+        await call.answer("Обновлено")
 
 
-# ============ CALLBACK КНОПОК ============
+# ============ CALLBACK: ВЫБОР ПРЕДМЕТА ============
 @dp.callback_query(F.data.startswith("subj:"))
 async def cb_subject(call: CallbackQuery):
     subj = call.data.split(":", 1)[1]
