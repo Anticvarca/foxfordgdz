@@ -225,21 +225,31 @@ TASK_VERBS = re.compile(
 
 
 def looks_like_task(text: str) -> bool:
-    """Проверяет, похож ли текст на школьное задание."""
+    """
+    Пропускает почти всё.
+    Блокирует только явный мусор: очень короткие сообщения без признаков задания.
+    """
     if not text:
         return False
     t = text.strip()
-    if len(t) < 4:
-        return False
+
+    # 1. Есть вопрос, цифры, подчёркивания (_), мат.символы → точно задание
     if "?" in t:
         return True
     if re.search(r"\d", t):
         return True
+    if "_" in t:
+        return True
+    if any(s in t for s in "=+-*/:;()[]"):
+        return True
     if TASK_VERBS.search(t):
         return True
-    # Длинное связное сообщение (>= 40 символов) — возможно тоже задача
-    if len(t) >= 40 and " " in t:
+
+    # 2. Длина >= 15 символов → пропускаем (вероятно, это описание задачи)
+    if len(t) >= 15:
         return True
+
+    # 3. Совсем короткое (<= 14) без признаков выше → блокируем
     return False
 
 
