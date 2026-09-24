@@ -103,6 +103,43 @@ log.info("Загружено: подписок=%d, в статистике=%d, �
          len(authorized), len(stats), len(user_subject), len(passwords),
          len(blocked), len(tickets), len(payments))
 
+# ============ КОНТЕКСТ ДИАЛОГА ============
+user_context: dict = {}
+CONTEXT_MAX_MESSAGES = 5
+CONTEXT_TTL_MINUTES = 15
+
+
+def add_to_context(user_id: int, text: str, msg_type: str = "text"):
+    if not text:
+        return
+    now = datetime.now()
+    ctx = user_context.setdefault(user_id, [])
+    ctx = [m for m in ctx if (now - m["time"]).total_seconds() < CONTEXT_TTL_MINUTES * 60]
+    ctx.append({"text": text, "time": now, "type": msg_type})
+    if len(ctx) > CONTEXT_MAX_MESSAGES:
+        ctx = ctx[-CONTEXT_MAX_MESSAGES:]
+    user_context[user_id] = ctx
+
+
+def get_context(user_id: int) -> str:
+    if user_id not in user_context:
+        return ""
+    now = datetime.now()
+    ctx = [m for m in user_context[user_id]
+           if (now - m["time"]).total_seconds() < CONTEXT_TTL_MINUTES * 60]
+    if not ctx:
+        return ""
+    lines = ["КОНТЕКСТ ПРЕДЫДУЩИХ СООБЩЕНИЙ (используй его при решении):"]
+    for i, m in enumerate(ctx, 1):
+        snippet = m["text"][:2000]
+        lines.append(f"--- Сообщение {i} ({m['type']}) ---")
+        lines.append(snippet)
+    return "\n".join(lines)
+
+
+def clear_context(user_id: int):
+    user_context.pop(user_id, None)
+
 
 def save_authorized():
     _save(AUTHORIZED_FILE, {str(k): v for k, v in authorized.items()})
@@ -177,11 +214,6 @@ def create_ticket(user_id: int, username: str, text: str) -> str:
 
 
 def extend_subscription(user_id: int, days=None) -> str:
-    """
-    Продлевает подписку.
-    days=None → бессрочная подписка.
-    Возвращает либо ISO-дату, либо "infinite".
-    """
     if days is None:
         authorized[user_id] = INFINITE
         save_authorized()
@@ -190,7 +222,6 @@ def extend_subscription(user_id: int, days=None) -> str:
 
     now = datetime.now()
     current_expire_iso = authorized.get(user_id)
-    # Если текущая подписка бессрочная — оставляем её
     if current_expire_iso == INFINITE:
         return INFINITE
     if current_expire_iso:
@@ -208,10 +239,6 @@ def extend_subscription(user_id: int, days=None) -> str:
 
 
 def get_subscription_status(user_id: int):
-    """
-    Возвращает (status, expire_dt_or_None, days_left)
-    status: "active" | "expired" | "none" | "infinite"
-    """
     if user_id not in authorized:
         return ("none", None, 0)
     value = authorized[user_id]
@@ -228,7 +255,6 @@ def get_subscription_status(user_id: int):
 
 
 def format_subscription(uid: int) -> str:
-    """Человекочитаемая строка про подписку."""
     status, expire_dt, days_left = get_subscription_status(uid)
     if status == "infinite":
         return "♾ Бессрочная"
@@ -254,7 +280,7 @@ TASK_VERBS = re.compile(
     r"докажи|сравни|составь|запиши|подчеркни|раскрой|укажи|посчитай|обозначь|"
     r"задание|упражнени|задач|тест|формул|уравнени|пример|разбор|анализ|"
     r"напиши|приведи|опиши|построй|постро|изобрази|соотнеси|распредел|"
-    r"прочитай|прочти|проверь|исправь|дополни|заполни|начерти)",
+    r"прочитай|прочти|проверь|исправь|дополни|заполни|начерти|choose|select|answer)",
     re.IGNORECASE,
 )
 
@@ -313,7 +339,6 @@ class AuthMiddleware(BaseMiddleware):
 
         status, expire_dt, days_left = get_subscription_status(user_id)
 
-        # Бессрочная подписка — пропускаем всё
         if status == "infinite":
             return await handler(event, data)
 
@@ -349,7 +374,6 @@ class AuthMiddleware(BaseMiddleware):
                     pwd_info["used_by_username"] = event.from_user.username or ""
                     _save(PASSWORDS_FILE, passwords)
 
-                    # Дни берём из пароля; если нет — стандарт
                     days = pwd_info.get("days", SUBSCRIPTION_DAYS)
                     new_val = extend_subscription(user_id, days)
                     touch_user(event.from_user)
@@ -560,8 +584,15 @@ async def cmd_help(message: types.Message):
         "/subject — сменить предмет\n"
         "/mysub — статус подписки\n"
         "/buy — купить/продлить доступ\n"
-        "/support — написать в поддержку"
+        "/support — написать в поддержку\n"
+        "/reset — сбросить контекст диалога"
     )
+
+
+@dp.message(Command("reset"))
+async def cmd_reset(message: types.Message):
+    clear_context(message.from_user.id)
+    await message.answer("🧹 Контекст диалога сброшен.")
 
 
 @dp.message(Command("subject"))
@@ -610,7 +641,6 @@ async def cmd_mysub(message: types.Message):
 @dp.message(Command("buy"))
 async def cmd_buy(message: types.Message):
     log.info("cmd_buy: user=%s", message.from_user.id)
-    # Если бессрочная — отказываем
     status, _, _ = get_subscription_status(message.from_user.id)
     if status == "infinite":
         await message.answer("✅ У вас ♾ бессрочный доступ. Оплата не нужна.")
@@ -694,7 +724,6 @@ async def successful_payment(message: types.Message):
         }
         _save(PAYMENTS_FILE, payments)
 
-        # Бессрочных через оплату не выдаём — только на SUBSCRIPTION_DAYS
         new_val = extend_subscription(user.id, SUBSCRIPTION_DAYS)
         touch_user(user)
 
@@ -928,7 +957,6 @@ async def handle_admin_delete_password(message: types.Message):
 
 # ============ ХЕЛПЕР: создать пароль ============
 def _create_passwords(count: int, days):
-    """Создаёт count паролей. days=None → бесконечные."""
     new_pwds = []
     for _ in range(count):
         pwd = generate_password()
@@ -1095,7 +1123,6 @@ async def cb_admin(call: CallbackQuery):
             await call.message.answer("Подписок пока нет.")
             await call.answer()
             return
-        # Собираем всё в один список
         items = []
         for uid, val in authorized.items():
             s = stats.get(str(uid), {})
@@ -1111,9 +1138,6 @@ async def cb_admin(call: CallbackQuery):
                     items.append((exp_dt, uid, uname, stars, "✅" if exp_dt > now else "⌛"))
                 except Exception:
                     pass
-        # Бессрочные — в начале, потом по дате
-        items.sort(key=lambda x: (x[0] is not None, x[0] or datetime.max), reverse=False)
-        # Хотим: сначала бессрочные, потом активные по убыванию даты, потом истёкшие
         infinite_items = [x for x in items if x[4] == "♾"]
         active_items = sorted([x for x in items if x[4] == "✅"], key=lambda x: x[0], reverse=True)
         expired_items = sorted([x for x in items if x[4] == "⌛"], key=lambda x: x[0], reverse=True)
@@ -1347,7 +1371,7 @@ async def handle_mode_question(message: types.Message):
     )
 
 
-# ============ ФОТО ============
+# ============ ФОТО (с контекстом) ============
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
     subj = user_subject.get(message.from_user.id, "general")
@@ -1372,8 +1396,19 @@ async def handle_photo(message: types.Message):
         compressed = out.getvalue()
         log.info("Фото сжато: %d → %d байт", original_size, len(compressed))
 
-        answer = await solve_image(compressed, message.caption or "", subj)
+        # Контекст: если есть предыдущие сообщения — используем их
+        ctx = get_context(message.from_user.id)
+        caption = message.caption or ""
+        if ctx:
+            log.info("К фото добавлен контекст (%d символов)", len(ctx))
+            caption = ctx + "\n\n--- ТЕКУЩЕЕ ЗАДАНИЕ (на фото) ---\n" + (
+                caption or "Реши задание с картинки, опираясь на контекст выше."
+            )
+
+        answer = await solve_image(compressed, caption, subj)
         touch_user(message.from_user, task_type="photo")
+        # Сбрасываем контекст после решения
+        clear_context(message.from_user.id)
     except Exception as e:
         log.error("Ошибка обработки фото: %s", e)
         traceback.print_exc()
@@ -1382,13 +1417,17 @@ async def handle_photo(message: types.Message):
     await send_long(message, answer)
 
 
-# ============ ТЕКСТ ============
+# ============ ТЕКСТ (с контекстом) ============
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     subj = user_subject.get(message.from_user.id, "general")
 
     if not looks_like_task(message.text):
         log.info("handle_text: не похоже на задание: %r", message.text[:60])
+        # Сохраняем длинный текст в контекст — вероятно, это текст для следующего фото
+        if len(message.text) >= 80:
+            add_to_context(message.from_user.id, message.text, "text")
+            log.info("handle_text: длинный текст сохранён в контекст")
         await message.answer(
             "🤔 Это не похоже на школьное задание.\n\n"
             "Пришли текст задачи, пример или упражнения — я решу.\n\n"
@@ -1396,14 +1435,24 @@ async def handle_text(message: types.Message):
             "• «Реши 2x + 5 = 11»\n"
             "• «Что такое фотосинтез?»\n"
             "• «Переведи how are you»\n"
-            "• «Вставь пропущенные буквы: к_рова, м_локо»"
+            "• «Вставь пропущенные буквы: к_рова, м_локо»\n\n"
+            "💡 Если это текст-контекст — можешь теперь отправить фото задания, "
+            "и я решу его с учётом этого текста."
         )
         return
 
+    # Это задание. Если есть контекст — добавляем
+    ctx = get_context(message.from_user.id)
+    full_question = message.text
+    if ctx:
+        log.info("К тексту добавлен контекст (%d символов)", len(ctx))
+        full_question = ctx + "\n\n--- ТЕКУЩЕЕ ЗАДАНИЕ ---\n" + message.text
+
     await bot.send_chat_action(message.chat.id, "typing")
     try:
-        answer = await solve_text(message.text, subj)
+        answer = await solve_text(full_question, subj)
         touch_user(message.from_user, task_type="text")
+        clear_context(message.from_user.id)
     except Exception as e:
         log.error("Ошибка обработки текста: %s", e)
         traceback.print_exc()
