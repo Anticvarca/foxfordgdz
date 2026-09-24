@@ -65,6 +65,8 @@ BLOCKED_FILE = DATA_DIR / "blocked.json"
 TICKETS_FILE = DATA_DIR / "tickets.json"
 PAYMENTS_FILE = DATA_DIR / "payments.json"
 
+INFINITE = "infinite"
+
 
 def _load(path, default):
     if path.exists():
@@ -174,9 +176,23 @@ def create_ticket(user_id: int, username: str, text: str) -> str:
     return ticket_id
 
 
-def extend_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS) -> datetime:
+def extend_subscription(user_id: int, days=None) -> str:
+    """
+    Продлевает подписку.
+    days=None → бессрочная подписка.
+    Возвращает либо ISO-дату, либо "infinite".
+    """
+    if days is None:
+        authorized[user_id] = INFINITE
+        save_authorized()
+        log.info("extend_subscription: user=%s INFINITE", user_id)
+        return INFINITE
+
     now = datetime.now()
     current_expire_iso = authorized.get(user_id)
+    # Если текущая подписка бессрочная — оставляем её
+    if current_expire_iso == INFINITE:
+        return INFINITE
     if current_expire_iso:
         try:
             current_expire = datetime.fromisoformat(current_expire_iso)
@@ -188,20 +204,39 @@ def extend_subscription(user_id: int, days: int = SUBSCRIPTION_DAYS) -> datetime
     authorized[user_id] = new_expire.isoformat(timespec="seconds")
     save_authorized()
     log.info("extend_subscription: user=%s new_expire=%s", user_id, new_expire)
-    return new_expire
+    return authorized[user_id]
 
 
 def get_subscription_status(user_id: int):
+    """
+    Возвращает (status, expire_dt_or_None, days_left)
+    status: "active" | "expired" | "none" | "infinite"
+    """
     if user_id not in authorized:
         return ("none", None, 0)
+    value = authorized[user_id]
+    if value == INFINITE:
+        return ("infinite", None, -1)
     try:
-        expire_dt = datetime.fromisoformat(authorized[user_id])
+        expire_dt = datetime.fromisoformat(value)
     except Exception:
         return ("none", None, 0)
     now = datetime.now()
     if expire_dt <= now:
         return ("expired", expire_dt, 0)
     return ("active", expire_dt, (expire_dt - now).days)
+
+
+def format_subscription(uid: int) -> str:
+    """Человекочитаемая строка про подписку."""
+    status, expire_dt, days_left = get_subscription_status(uid)
+    if status == "infinite":
+        return "♾ Бессрочная"
+    if status == "active":
+        return f"до {expire_dt.strftime('%d.%m.%Y')} ({days_left} дн.)"
+    if status == "expired":
+        return f"истекла {expire_dt.strftime('%d.%m.%Y')}"
+    return "нет"
 
 
 def get_user_stars_paid(user_id: int) -> int:
@@ -225,15 +260,9 @@ TASK_VERBS = re.compile(
 
 
 def looks_like_task(text: str) -> bool:
-    """
-    Пропускает почти всё.
-    Блокирует только явный мусор: очень короткие сообщения без признаков задания.
-    """
     if not text:
         return False
     t = text.strip()
-
-    # 1. Есть вопрос, цифры, подчёркивания (_), мат.символы → точно задание
     if "?" in t:
         return True
     if re.search(r"\d", t):
@@ -244,12 +273,8 @@ def looks_like_task(text: str) -> bool:
         return True
     if TASK_VERBS.search(t):
         return True
-
-    # 2. Длина >= 15 символов → пропускаем (вероятно, это описание задачи)
     if len(t) >= 15:
         return True
-
-    # 3. Совсем короткое (<= 14) без признаков выше → блокируем
     return False
 
 
@@ -288,6 +313,10 @@ class AuthMiddleware(BaseMiddleware):
 
         status, expire_dt, days_left = get_subscription_status(user_id)
 
+        # Бессрочная подписка — пропускаем всё
+        if status == "infinite":
+            return await handler(event, data)
+
         if status == "active":
             if days_left <= 3 and event.text and not event.text.startswith("/"):
                 try:
@@ -319,19 +348,33 @@ class AuthMiddleware(BaseMiddleware):
                     pwd_info["used_by_name"] = event.from_user.full_name
                     pwd_info["used_by_username"] = event.from_user.username or ""
                     _save(PASSWORDS_FILE, passwords)
-                    expire_dt = extend_subscription(user_id)
+
+                    # Дни берём из пароля; если нет — стандарт
+                    days = pwd_info.get("days", SUBSCRIPTION_DAYS)
+                    new_val = extend_subscription(user_id, days)
                     touch_user(event.from_user)
-                    await event.answer(
-                        f"✅ Пароль активирован! Доступ на {SUBSCRIPTION_DAYS} дней "
-                        f"до {expire_dt.strftime('%d.%m.%Y')}.",
-                        reply_markup=subject_kb(),
-                    )
+
+                    if new_val == INFINITE:
+                        await event.answer(
+                            "✅ Пароль активирован! Доступ ♾ БЕССРОЧНЫЙ.",
+                            reply_markup=subject_kb(),
+                        )
+                    else:
+                        exp_dt = datetime.fromisoformat(new_val)
+                        await event.answer(
+                            f"✅ Пароль активирован! Доступ на {days} дней "
+                            f"до {exp_dt.strftime('%d.%m.%Y')}.",
+                            reply_markup=subject_kb(),
+                        )
                     return
                 elif pwd_info.get("used_by") == user_id:
-                    expire_dt = extend_subscription(user_id)
-                    await event.answer(
-                        f"✅ Доступ продлён до {expire_dt.strftime('%d.%m.%Y')}."
-                    )
+                    days = pwd_info.get("days", SUBSCRIPTION_DAYS)
+                    new_val = extend_subscription(user_id, days)
+                    if new_val == INFINITE:
+                        await event.answer("✅ Доступ продлён ♾ БЕССРОЧНО.")
+                    else:
+                        exp_dt = datetime.fromisoformat(new_val)
+                        await event.answer(f"✅ Доступ продлён до {exp_dt.strftime('%d.%m.%Y')}.")
                     return
                 else:
                     await event.answer("❌ Этот пароль уже активирован другим пользователем.")
@@ -381,8 +424,10 @@ def buy_kb():
 
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔑 1 пароль", callback_data="admin:gen1"),
+        [InlineKeyboardButton(text=f"🔑 1 пароль ({SUBSCRIPTION_DAYS}д)", callback_data="admin:gen1"),
          InlineKeyboardButton(text="🔑🔑 5 паролей", callback_data="admin:gen5")],
+        [InlineKeyboardButton(text="♾ 1 бесконечный", callback_data="admin:gen1_inf"),
+         InlineKeyboardButton(text="♾♾ 5 бесконечных", callback_data="admin:gen5_inf")],
         [InlineKeyboardButton(text="📋 Список паролей", callback_data="admin:list"),
          InlineKeyboardButton(text="🗑 Удалить пароли", callback_data="admin:del_menu")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users"),
@@ -411,9 +456,13 @@ def admin_panel_text() -> str:
 
     active_subs = 0
     expired_subs = 0
-    for uid, exp_iso in authorized.items():
+    infinite_subs = 0
+    for uid, val in authorized.items():
+        if val == INFINITE:
+            infinite_subs += 1
+            continue
         try:
-            exp_dt = datetime.fromisoformat(exp_iso)
+            exp_dt = datetime.fromisoformat(val)
             if exp_dt > datetime.now():
                 active_subs += 1
             else:
@@ -428,6 +477,7 @@ def admin_panel_text() -> str:
         f"🎛 Админ-панель\n\n"
         f"🔑 Паролей: {total_pwd} (🆓 {free_pwd} / ✅ {used_pwd})\n"
         f"💳 Подписок активных: {active_subs}\n"
+        f"♾ Бессрочных: {infinite_subs}\n"
         f"⌛ Подписок истекших: {expired_subs}\n"
         f"🚫 Заблокированных: {len(blocked)}\n"
         f"🎫 Открытых тикетов: {open_tickets}\n"
@@ -460,6 +510,16 @@ async def cmd_start(message: types.Message):
 
     status, expire_dt, days_left = get_subscription_status(message.from_user.id)
     log.info("cmd_start: user=%s status=%s", message.from_user.id, status)
+
+    if status == "infinite":
+        current = SUBJECT_NAMES.get(user_subject[message.from_user.id], "💬 Общее")
+        await message.answer(
+            f"Привет! Текущий режим: {current}\n"
+            f"💳 Подписка: ♾ Бессрочная\n"
+            f"Выбери предмет или сразу кидай задачу.",
+            reply_markup=subject_kb(),
+        )
+        return
 
     if status == "active":
         current = SUBJECT_NAMES.get(user_subject[message.from_user.id], "💬 Общее")
@@ -508,7 +568,7 @@ async def cmd_help(message: types.Message):
 async def cmd_subject(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         status, _, _ = get_subscription_status(message.from_user.id)
-        if status != "active":
+        if status not in ("active", "infinite"):
             await message.answer(
                 "🔒 Смена предмета доступна только с активной подпиской.",
                 reply_markup=buy_kb(),
@@ -524,7 +584,12 @@ async def cmd_mysub(message: types.Message):
     status, expire_dt, days_left = get_subscription_status(message.from_user.id)
     stars_paid = get_user_stars_paid(message.from_user.id)
 
-    if status == "active":
+    if status == "infinite":
+        await message.answer(
+            f"💳 Ваша подписка: ♾ Бессрочная\n"
+            f"💰 Всего оплачено: {stars_paid} ⭐"
+        )
+    elif status == "active":
         await message.answer(
             f"💳 Ваша подписка активна.\n"
             f"📅 Действует до: {expire_dt.strftime('%d.%m.%Y %H:%M')}\n"
@@ -545,12 +610,21 @@ async def cmd_mysub(message: types.Message):
 @dp.message(Command("buy"))
 async def cmd_buy(message: types.Message):
     log.info("cmd_buy: user=%s", message.from_user.id)
+    # Если бессрочная — отказываем
+    status, _, _ = get_subscription_status(message.from_user.id)
+    if status == "infinite":
+        await message.answer("✅ У вас ♾ бессрочный доступ. Оплата не нужна.")
+        return
     await send_stars_invoice(message)
 
 
 @dp.callback_query(F.data == "buy")
 async def cb_buy(call: CallbackQuery):
     log.info("cb_buy: user=%s", call.from_user.id)
+    status, _, _ = get_subscription_status(call.from_user.id)
+    if status == "infinite":
+        await call.answer("✅ У вас ♾ бессрочный доступ", show_alert=True)
+        return
     await send_stars_invoice(call.message)
     await call.answer()
 
@@ -620,16 +694,23 @@ async def successful_payment(message: types.Message):
         }
         _save(PAYMENTS_FILE, payments)
 
-        new_expire = extend_subscription(user.id)
+        # Бессрочных через оплату не выдаём — только на SUBSCRIPTION_DAYS
+        new_val = extend_subscription(user.id, SUBSCRIPTION_DAYS)
         touch_user(user)
 
         total_paid = get_user_stars_paid(user.id)
-        log.info("!!! Подписка юзера %s до %s. Всего оплачено: %s ⭐",
-                 user.id, new_expire, total_paid)
+        log.info("!!! Подписка юзера %s = %s. Всего оплачено: %s ⭐",
+                 user.id, new_val, total_paid)
+
+        if new_val == INFINITE:
+            exp_line = "♾ Бессрочная"
+        else:
+            exp_dt = datetime.fromisoformat(new_val)
+            exp_line = exp_dt.strftime('%d.%m.%Y %H:%M')
 
         await message.answer(
             f"✅ Оплата получена! Подписка активна.\n\n"
-            f"📅 Действует до: {new_expire.strftime('%d.%m.%Y %H:%M')}\n"
+            f"📅 Действует до: {exp_line}\n"
             f"⏰ Это {SUBSCRIPTION_DAYS} дней доступа.\n"
             f"💰 Оплачено: {amount} ⭐ (всего: {total_paid} ⭐)\n\n"
             f"Проверить статус — /mysub",
@@ -644,7 +725,7 @@ async def successful_payment(message: types.Message):
                 f"🆔 {user.id}\n"
                 f"⭐ Оплачено: {amount} звёзд\n"
                 f"⭐ Всего от юзера: {total_paid} звёзд\n"
-                f"📅 Подписка до: {new_expire.strftime('%d.%m.%Y')}",
+                f"📅 Подписка до: {exp_line}",
             )
         except Exception as e:
             log.warning("Не смог уведомить админа: %s", e)
@@ -730,16 +811,21 @@ async def handle_add_user(message: types.Message):
     except ValueError:
         await message.answer("❌ Это не похоже на ID. Отправь число.")
         return
-    new_expire = extend_subscription(uid, SUBSCRIPTION_DAYS)
+    new_val = extend_subscription(uid, SUBSCRIPTION_DAYS)
+    if new_val == INFINITE:
+        exp_line = "♾ Бессрочная"
+    else:
+        exp_dt = datetime.fromisoformat(new_val)
+        exp_line = exp_dt.strftime('%d.%m.%Y %H:%M')
     await message.answer(
         f"✅ Пользователю {uid} выдан доступ на {SUBSCRIPTION_DAYS} дней.\n"
-        f"📅 До: {new_expire.strftime('%d.%m.%Y %H:%M')}"
+        f"📅 До: {exp_line}"
     )
     try:
         await bot.send_message(
             uid,
             f"🎁 Администратор выдал вам доступ на {SUBSCRIPTION_DAYS} дней!\n"
-            f"📅 До: {new_expire.strftime('%d.%m.%Y')}\n\n"
+            f"📅 До: {exp_line}\n\n"
             f"Открой /start, чтобы начать."
         )
     except Exception as e:
@@ -840,6 +926,26 @@ async def handle_admin_delete_password(message: types.Message):
     await message.answer(f"✅ Пароль `{pwd_key}` удалён.")
 
 
+# ============ ХЕЛПЕР: создать пароль ============
+def _create_passwords(count: int, days):
+    """Создаёт count паролей. days=None → бесконечные."""
+    new_pwds = []
+    for _ in range(count):
+        pwd = generate_password()
+        while pwd in passwords:
+            pwd = generate_password()
+        passwords[pwd] = {
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "used_by": None,
+            "used_at": None,
+            "note": "",
+            "days": days,
+        }
+        new_pwds.append(pwd)
+    _save(PASSWORDS_FILE, passwords)
+    return new_pwds
+
+
 # ============ CALLBACK: АДМИН-ПАНЕЛЬ ============
 @dp.callback_query(F.data.startswith("admin:"))
 async def cb_admin(call: CallbackQuery):
@@ -849,34 +955,40 @@ async def cb_admin(call: CallbackQuery):
     action = call.data.split(":", 1)[1]
 
     if action == "gen1":
-        pwd = generate_password()
-        while pwd in passwords:
-            pwd = generate_password()
-        passwords[pwd] = {"created": datetime.now().isoformat(timespec="seconds"),
-                          "used_by": None, "used_at": None, "note": ""}
-        _save(PASSWORDS_FILE, passwords)
+        pwds = _create_passwords(1, SUBSCRIPTION_DAYS)
         await call.message.answer(
-            f"🔑 Новый пароль:\n\n`{pwd}`\n\nДаёт {SUBSCRIPTION_DAYS} дней доступа.",
+            f"🔑 Новый пароль ({SUBSCRIPTION_DAYS} дней):\n\n`{pwds[0]}`\n\n"
+            f"Скопируй и продай покупателю.",
             parse_mode="Markdown",
         )
         await call.answer("Создан")
 
     elif action == "gen5":
-        new_pwds = []
-        for _ in range(5):
-            pwd = generate_password()
-            while pwd in passwords:
-                pwd = generate_password()
-            passwords[pwd] = {"created": datetime.now().isoformat(timespec="seconds"),
-                              "used_by": None, "used_at": None, "note": ""}
-            new_pwds.append(pwd)
-        _save(PASSWORDS_FILE, passwords)
+        pwds = _create_passwords(5, SUBSCRIPTION_DAYS)
         await call.message.answer(
-            f"🔑 5 паролей (каждый = {SUBSCRIPTION_DAYS} дней):\n\n"
-            + "\n".join(f"`{p}`" for p in new_pwds),
+            f"🔑 5 паролей ({SUBSCRIPTION_DAYS} дней каждый):\n\n"
+            + "\n".join(f"`{p}`" for p in pwds),
             parse_mode="Markdown",
         )
         await call.answer("Создано 5")
+
+    elif action == "gen1_inf":
+        pwds = _create_passwords(1, None)
+        await call.message.answer(
+            f"♾ Новый БЕССРОЧНЫЙ пароль:\n\n`{pwds[0]}`\n\n"
+            f"Даёт ♾ бессрочный доступ.",
+            parse_mode="Markdown",
+        )
+        await call.answer("Создан бессрочный")
+
+    elif action == "gen5_inf":
+        pwds = _create_passwords(5, None)
+        await call.message.answer(
+            "♾ 5 БЕССРОЧНЫХ паролей:\n\n"
+            + "\n".join(f"`{p}`" for p in pwds),
+            parse_mode="Markdown",
+        )
+        await call.answer("Создано 5 бессрочных")
 
     elif action == "list":
         if not passwords:
@@ -884,12 +996,17 @@ async def cb_admin(call: CallbackQuery):
             await call.answer()
             return
         lines = ["📋 Список паролей:\n"]
-        free = [p for p, v in passwords.items() if not v.get("used_by")]
+        free = [(p, v) for p, v in passwords.items() if not v.get("used_by")]
         used = [(p, v) for p, v in passwords.items() if v.get("used_by")]
+
+        def _tag(v):
+            d = v.get("days", SUBSCRIPTION_DAYS)
+            return "♾" if d is None else f"{d}д"
+
         if free:
             lines.append(f"🆓 Свободные ({len(free)}):")
-            for p in free:
-                lines.append(f"   `{p}`")
+            for p, v in free:
+                lines.append(f"   `{p}` [{_tag(v)}]")
             lines.append("")
         if used:
             lines.append(f"✅ Использованные ({len(used)}):")
@@ -897,7 +1014,7 @@ async def cb_admin(call: CallbackQuery):
                 name = v.get("used_by_name", "?")
                 uname = v.get("used_by_username", "")
                 uname_str = f" @{uname}" if uname else ""
-                lines.append(f"   `{p}` → {name}{uname_str}")
+                lines.append(f"   `{p}` [{_tag(v)}] → {name}{uname_str}")
         text = "\n".join(lines)
         if len(text) > 4000:
             text = text[:4000] + "\n... (обрезано)"
@@ -978,29 +1095,43 @@ async def cb_admin(call: CallbackQuery):
             await call.message.answer("Подписок пока нет.")
             await call.answer()
             return
+        # Собираем всё в один список
         items = []
-        for uid, exp_iso in authorized.items():
-            try:
-                exp_dt = datetime.fromisoformat(exp_iso)
-                now = datetime.now()
-                days = (exp_dt - now).days
-                s = stats.get(str(uid), {})
-                uname = s.get("username", "?")
-                stars = get_user_stars_paid(uid)
-                items.append((exp_dt, uid, uname, days, stars, "✅" if exp_dt > now else "⌛"))
-            except Exception:
-                pass
-        items.sort(reverse=True)
+        for uid, val in authorized.items():
+            s = stats.get(str(uid), {})
+            uname = s.get("username", "?")
+            stars = get_user_stars_paid(uid)
+            if val == INFINITE:
+                items.append((None, uid, uname, stars, "♾"))
+            else:
+                try:
+                    exp_dt = datetime.fromisoformat(val)
+                    now = datetime.now()
+                    days = (exp_dt - now).days
+                    items.append((exp_dt, uid, uname, stars, "✅" if exp_dt > now else "⌛"))
+                except Exception:
+                    pass
+        # Бессрочные — в начале, потом по дате
+        items.sort(key=lambda x: (x[0] is not None, x[0] or datetime.max), reverse=False)
+        # Хотим: сначала бессрочные, потом активные по убыванию даты, потом истёкшие
+        infinite_items = [x for x in items if x[4] == "♾"]
+        active_items = sorted([x for x in items if x[4] == "✅"], key=lambda x: x[0], reverse=True)
+        expired_items = sorted([x for x in items if x[4] == "⌛"], key=lambda x: x[0], reverse=True)
+        ordered = infinite_items + active_items + expired_items
+
         lines = ["💳 Подписки:\n"]
-        for exp_dt, uid, uname, days, stars, status in items[:30]:
-            if status == "✅":
+        for exp_dt, uid, uname, stars, status in ordered[:40]:
+            if status == "♾":
+                lines.append(f"♾ @{uname} (id {uid}) — БЕССРОЧНАЯ · 💰 {stars} ⭐")
+            elif status == "✅":
+                days = (exp_dt - datetime.now()).days
                 lines.append(
-                    f"{status} @{uname} (id {uid}) — до {exp_dt.strftime('%d.%m.%Y')} "
+                    f"✅ @{uname} (id {uid}) — до {exp_dt.strftime('%d.%m.%Y')} "
                     f"({days} дн.) · 💰 {stars} ⭐"
                 )
             else:
                 lines.append(
-                    f"{status} @{uname} (id {uid}) — истекла {exp_dt.strftime('%d.%m.%Y')} "
+                    f"⌛ @{uname} (id {uid}) — истекла {exp_dt.strftime('%d.%m.%Y')} "
                     f"· 💰 {stars} ⭐"
                 )
         text = "\n".join(lines)
@@ -1023,6 +1154,8 @@ async def cb_admin(call: CallbackQuery):
             status, _, _ = get_subscription_status(uid_int)
             if uid_int in blocked:
                 st = "🚫"
+            elif status == "infinite":
+                st = "♾"
             elif status == "active":
                 st = "✅"
             elif status == "expired":
@@ -1090,6 +1223,9 @@ async def cb_user_action(call: CallbackQuery):
         if is_blocked:
             status_txt = "🚫 ЗАБЛОКИРОВАН"
             exp_txt = "—"
+        elif status == "infinite":
+            status_txt = "♾ БЕССРОЧНАЯ"
+            exp_txt = "—"
         elif status == "active":
             status_txt = "✅ Подписка активна"
             exp_txt = f"{expire_dt.strftime('%d.%m.%Y')} ({days_left} дн.)"
@@ -1121,10 +1257,13 @@ async def cb_user_action(call: CallbackQuery):
         else:
             buttons.append(InlineKeyboardButton(text="🚫 Заблокировать", callback_data=f"usr:block:{uid}"))
         buttons.append(InlineKeyboardButton(text=f"🎁 +{SUBSCRIPTION_DAYS}д", callback_data=f"usr:extend:{uid}"))
+        buttons.append(InlineKeyboardButton(text="♾ Сделать бессрочным", callback_data=f"usr:infinite:{uid}"))
         buttons.append(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"usr:delete:{uid}"))
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            buttons[:2], buttons[2:],
+            buttons[:2],
+            buttons[2:4],
+            buttons[4:],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:users")],
         ])
         await call.message.answer(text, reply_markup=kb)
@@ -1143,16 +1282,28 @@ async def cb_user_action(call: CallbackQuery):
         await call.answer("Разблокирован")
 
     elif action == "extend":
-        new_expire = extend_subscription(uid, SUBSCRIPTION_DAYS)
-        await call.message.answer(
-            f"🎁 {uid} продлён на {SUBSCRIPTION_DAYS} дней. До: {new_expire.strftime('%d.%m.%Y')}"
-        )
+        new_val = extend_subscription(uid, SUBSCRIPTION_DAYS)
+        if new_val == INFINITE:
+            exp_line = "♾ Бессрочная"
+        else:
+            exp_dt = datetime.fromisoformat(new_val)
+            exp_line = exp_dt.strftime('%d.%m.%Y')
+        await call.message.answer(f"🎁 {uid} продлён на {SUBSCRIPTION_DAYS} дней. До: {exp_line}")
         try:
             await bot.send_message(uid,
-                f"🎁 Подписка продлена на {SUBSCRIPTION_DAYS} дней.\n📅 До: {new_expire.strftime('%d.%m.%Y')}")
+                f"🎁 Подписка продлена на {SUBSCRIPTION_DAYS} дней.\n📅 До: {exp_line}")
         except Exception:
             pass
         await call.answer("Продлено")
+
+    elif action == "infinite":
+        extend_subscription(uid, None)
+        await call.message.answer(f"♾ Пользователю {uid} выдан БЕССРОЧНЫЙ доступ.")
+        try:
+            await bot.send_message(uid, "🎁 Вам выдан ♾ бессрочный доступ!")
+        except Exception:
+            pass
+        await call.answer("Бессрочный")
 
     elif action == "delete":
         blocked.discard(uid)
@@ -1174,7 +1325,7 @@ async def cb_user_action(call: CallbackQuery):
 async def cb_subject(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         status, _, _ = get_subscription_status(call.from_user.id)
-        if status != "active":
+        if status not in ("active", "infinite"):
             await call.answer("🔒 Нужна подписка", show_alert=True)
             return
     subj = call.data.split(":", 1)[1]
@@ -1236,7 +1387,6 @@ async def handle_photo(message: types.Message):
 async def handle_text(message: types.Message):
     subj = user_subject.get(message.from_user.id, "general")
 
-    # ПРОВЕРКА: похоже ли на задание?
     if not looks_like_task(message.text):
         log.info("handle_text: не похоже на задание: %r", message.text[:60])
         await message.answer(
