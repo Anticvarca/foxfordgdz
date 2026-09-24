@@ -205,12 +205,42 @@ def get_subscription_status(user_id: int):
 
 
 def get_user_stars_paid(user_id: int) -> int:
-    """Сколько всего звёзд заплатил пользователь."""
     total = 0
     for p in payments.values():
         if p.get("user_id") == user_id and p.get("status") == "paid":
             total += p.get("amount", 0)
     return total
+
+
+# ============ ПРОВЕРКА: ЭТО ЗАДАНИЕ ИЛИ БРЕД? ============
+TASK_VERBS = re.compile(
+    r"(реши|решить|реша|найди|найти|определ|вычисли|перевед|перевод|вставь|встав|"
+    r"выбери|выбер|ответь|ответ|что такое|почему|назови|выпиши|объясни|"
+    r"докажи|сравни|составь|запиши|подчеркни|раскрой|укажи|посчитай|обозначь|"
+    r"задание|упражнени|задач|тест|формул|уравнени|пример|разбор|анализ|"
+    r"напиши|приведи|опиши|построй|постро|изобрази|соотнеси|распредел|"
+    r"прочитай|прочти|проверь|исправь|дополни|заполни|начерти)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_task(text: str) -> bool:
+    """Проверяет, похож ли текст на школьное задание."""
+    if not text:
+        return False
+    t = text.strip()
+    if len(t) < 4:
+        return False
+    if "?" in t:
+        return True
+    if re.search(r"\d", t):
+        return True
+    if TASK_VERBS.search(t):
+        return True
+    # Длинное связное сообщение (>= 40 символов) — возможно тоже задача
+    if len(t) >= 40 and " " in t:
+        return True
+    return False
 
 
 # ============ СОСТОЯНИЯ АДМИНА ============
@@ -897,7 +927,6 @@ async def cb_admin(call: CallbackQuery):
         paid = [p for p in payments.values() if p.get("status") == "paid"]
         total_stars = sum(p.get("amount", 0) for p in paid)
 
-        # Топ плательщиков
         stars_by_user = {}
         for p in paid:
             uid = p.get("user_id")
@@ -1196,6 +1225,21 @@ async def handle_photo(message: types.Message):
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     subj = user_subject.get(message.from_user.id, "general")
+
+    # ПРОВЕРКА: похоже ли на задание?
+    if not looks_like_task(message.text):
+        log.info("handle_text: не похоже на задание: %r", message.text[:60])
+        await message.answer(
+            "🤔 Это не похоже на школьное задание.\n\n"
+            "Пришли текст задачи, пример или упражнения — я решу.\n\n"
+            "Например:\n"
+            "• «Реши 2x + 5 = 11»\n"
+            "• «Что такое фотосинтез?»\n"
+            "• «Переведи how are you»\n"
+            "• «Вставь пропущенные буквы: к_рова, м_локо»"
+        )
+        return
+
     await bot.send_chat_action(message.chat.id, "typing")
     try:
         answer = await solve_text(message.text, subj)
