@@ -19,17 +19,13 @@ client = AsyncOpenAI(
     timeout=180.0,
 )
 
-# Reasoning-модель OpenAI — «думает» перед ответом, как DeepSeek-R1
-# Альтернативы: "o1-preview" (мощнее, дороже) или "o1" (самая новая)
-MODEL = "o1-mini"
+# Новая reasoning-модель OpenAI — поддерживает текст и изображения
+MODEL = "gpt-6-luna"
 
-# Сколько усилий тратит на размышления: "low" / "medium" / "high"
+# Уровень «размышлений»: "minimal" / "low" / "medium" / "high"
 REASONING_EFFORT = "medium"
 
 
-# ═══════════════════════════════════════════════════════════
-# ОСНОВНОЙ ПРОМПТ (упрощён для o1 — он и так думает сам)
-# ═══════════════════════════════════════════════════════════
 SYSTEM_PROMPT = """Ты — эксперт-репетитор. Решаешь школьные задания без ошибок.
 Ты УЖЕ умеешь думать пошагово — используй это.
 
@@ -54,9 +50,6 @@ SYSTEM_PROMPT = """Ты — эксперт-репетитор. Решаешь ш
 """
 
 
-# ═══════════════════════════════════════════════════════════
-# ШПАРГАЛКА ПО РУССКОМУ ЯЗЫКУ
-# ═══════════════════════════════════════════════════════════
 RUSSIAN_MATCHING = """
 
 ШПАРГАЛКА ПО РУССКОМУ ЯЗЫКУ:
@@ -71,9 +64,6 @@ RUSSIAN_MATCHING = """
 """
 
 
-# ═══════════════════════════════════════════════════════════
-# ШПАРГАЛКА ПО ИСТОРИИ
-# ═══════════════════════════════════════════════════════════
 HISTORY_MATCHING = """
 
 ПРАВИЛА ДЛЯ ИСТОРИИ:
@@ -84,9 +74,6 @@ HISTORY_MATCHING = """
 """
 
 
-# ═══════════════════════════════════════════════════════════
-# ШПАРГАЛКА ПО ГЕОГРАФИИ
-# ═══════════════════════════════════════════════════════════
 GEOGRAPHY_MATCHING = """
 
 ПРАВИЛА ДЛЯ ГЕОГРАФИИ:
@@ -124,7 +111,7 @@ SUBJECT_HINTS = {
 
 
 async def _call_with_retry(messages: list, max_attempts: int = 3, timeout: float = 180.0) -> str:
-    """Отправляет запрос в o1-mini с retry."""
+    """Отправляет запрос в gpt-6-luna с retry."""
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -163,7 +150,6 @@ async def solve_text(question: str, subject: str = "general") -> str:
     hint = SUBJECT_HINTS.get(subject, SUBJECT_HINTS["general"])
     extra = get_extra_hint(subject)
 
-    # o1-mini не поддерживает system-сообщения — весь промпт идёт в user
     full_prompt = SYSTEM_PROMPT + extra + "\n\n" + hint + "\n\n--- ЗАДАНИЕ ---\n" + question
 
     messages = [
@@ -190,7 +176,6 @@ async def solve_image(image_bytes: bytes, caption: str = "", subject: str = "gen
         "Отвечай коротко."
     )
 
-    # o1-mini поддерживает vision через image_url
     user_content = [
         {
             "type": "text",
