@@ -103,42 +103,35 @@ log.info("Загружено: подписок=%d, в статистике=%d, �
          len(authorized), len(stats), len(user_subject), len(passwords),
          len(blocked), len(tickets), len(payments))
 
-# ============ КОНТЕКСТ ДИАЛОГА ============
-user_context: dict = {}
-CONTEXT_MAX_MESSAGES = 5
-CONTEXT_TTL_MINUTES = 15
+# ============ ПОСЛЕДНЕЕ СООБЩЕНИЕ (для контекста) ============
+# Хранит последнее сообщение пользователя: текст или фото.
+# Поддерживает два сценария:
+#   1. Текст → Фото: текст становится контекстом для фото
+#   2. Фото → Текст: текст становится контекстом для фото (перерешивание)
+last_message: dict = {}
+LAST_TTL_MINUTES = 10
 
 
-def add_to_context(user_id: int, text: str, msg_type: str = "text"):
-    if not text:
-        return
-    now = datetime.now()
-    ctx = user_context.setdefault(user_id, [])
-    ctx = [m for m in ctx if (now - m["time"]).total_seconds() < CONTEXT_TTL_MINUTES * 60]
-    ctx.append({"text": text, "time": now, "type": msg_type})
-    if len(ctx) > CONTEXT_MAX_MESSAGES:
-        ctx = ctx[-CONTEXT_MAX_MESSAGES:]
-    user_context[user_id] = ctx
+def save_last_message(user_id: int, msg_type: str, **kwargs):
+    """Сохраняет последнее сообщение."""
+    kwargs["type"] = msg_type
+    kwargs["time"] = datetime.now()
+    last_message[user_id] = kwargs
 
 
-def get_context(user_id: int) -> str:
-    if user_id not in user_context:
-        return ""
-    now = datetime.now()
-    ctx = [m for m in user_context[user_id]
-           if (now - m["time"]).total_seconds() < CONTEXT_TTL_MINUTES * 60]
-    if not ctx:
-        return ""
-    lines = ["КОНТЕКСТ ПРЕДЫДУЩИХ СООБЩЕНИЙ (используй его при решении):"]
-    for i, m in enumerate(ctx, 1):
-        snippet = m["text"][:2000]
-        lines.append(f"--- Сообщение {i} ({m['type']}) ---")
-        lines.append(snippet)
-    return "\n".join(lines)
+def get_last_message(user_id: int):
+    """Возвращает последнее сообщение, если оно не устарело."""
+    msg = last_message.get(user_id)
+    if not msg:
+        return None
+    if (datetime.now() - msg["time"]).total_seconds() > LAST_TTL_MINUTES * 60:
+        last_message.pop(user_id, None)
+        return None
+    return msg
 
 
-def clear_context(user_id: int):
-    user_context.pop(user_id, None)
+def clear_last_message(user_id: int):
+    last_message.pop(user_id, None)
 
 
 def save_authorized():
@@ -254,17 +247,6 @@ def get_subscription_status(user_id: int):
     return ("active", expire_dt, (expire_dt - now).days)
 
 
-def format_subscription(uid: int) -> str:
-    status, expire_dt, days_left = get_subscription_status(uid)
-    if status == "infinite":
-        return "♾ Бессрочная"
-    if status == "active":
-        return f"до {expire_dt.strftime('%d.%m.%Y')} ({days_left} дн.)"
-    if status == "expired":
-        return f"истекла {expire_dt.strftime('%d.%m.%Y')}"
-    return "нет"
-
-
 def get_user_stars_paid(user_id: int) -> int:
     total = 0
     for p in payments.values():
@@ -273,7 +255,7 @@ def get_user_stars_paid(user_id: int) -> int:
     return total
 
 
-# ============ ПРОВЕРКА: ЭТО ЗАДАНИЕ ИЛИ БРЕД? ============
+# ============ ПРОВЕРКА: ЭТО ЗАДАНИЕ ИЛИ КОНТЕКСТ? ============
 TASK_VERBS = re.compile(
     r"(реши|решить|реша|найди|найти|определ|вычисли|перевед|перевод|вставь|встав|"
     r"выбери|выбер|ответь|ответ|что такое|почему|назови|выпиши|объясни|"
@@ -304,6 +286,20 @@ def looks_like_task(text: str) -> bool:
     return False
 
 
+def looks_like_context(text: str) -> bool:
+    """Проверяет, похож ли текст на КОНТЕКСТ (текст для задачи),
+    а не на само задание. Контекст — длинный текст без явных глаголов-заданий."""
+    if not text:
+        return False
+    t = text.strip()
+    if len(t) < 80:
+        return False
+    # Если есть явные глаголы-задания — это скорее задание
+    if TASK_VERBS.search(t):
+        return False
+    return True
+
+
 # ============ СОСТОЯНИЯ АДМИНА ============
 admin_states: dict = {}
 
@@ -327,7 +323,7 @@ class AuthMiddleware(BaseMiddleware):
             log.info("MW: пропускаю successful_payment")
             return await handler(event, data)
 
-        if event.text and event.text.startswith(("/start", "/support", "/mysub", "/buy", "/help")):
+        if event.text and event.text.startswith(("/start", "/support", "/mysub", "/buy", "/help", "/reset")):
             return await handler(event, data)
 
         if event.text and get_open_ticket(user_id):
@@ -591,7 +587,7 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: types.Message):
-    clear_context(message.from_user.id)
+    clear_last_message(message.from_user.id)
     await message.answer("🧹 Контекст диалога сброшен.")
 
 
@@ -1371,12 +1367,14 @@ async def handle_mode_question(message: types.Message):
     )
 
 
-# ============ ФОТО (с контекстом) ============
+# ============ ФОТО ============
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
-    subj = user_subject.get(message.from_user.id, "general")
+    user_id = message.from_user.id
+    subj = user_subject.get(user_id, "general")
     mode_name = SUBJECT_NAMES.get(subj, subj)
     await message.answer(f"Решаю... (режим: {mode_name})")
+
     try:
         photo = message.photo[-1]
         file = await bot.get_file(photo.file_id)
@@ -1396,19 +1394,33 @@ async def handle_photo(message: types.Message):
         compressed = out.getvalue()
         log.info("Фото сжато: %d → %d байт", original_size, len(compressed))
 
-        # Контекст: если есть предыдущие сообщения — используем их
-        ctx = get_context(message.from_user.id)
         caption = message.caption or ""
-        if ctx:
-            log.info("К фото добавлен контекст (%d символов)", len(ctx))
-            caption = ctx + "\n\n--- ТЕКУЩЕЕ ЗАДАНИЕ (на фото) ---\n" + (
-                caption or "Реши задание с картинки, опираясь на контекст выше."
+
+        # Проверяем, есть ли предыдущее сообщение-текст (контекст)
+        prev = get_last_message(user_id)
+        if prev and prev["type"] == "text":
+            log.info("Найден контекст (текст) — использую его для фото")
+            combined_caption = (
+                f"КОНТЕКСТ (используй при решении, это важно):\n"
+                f"{prev['text']}\n\n"
+                f"---\n"
+                f"ЗАДАНИЕ (на фото): {caption or 'Реши задание с картинки, опираясь на контекст выше.'}"
+            )
+            answer = await solve_image(compressed, combined_caption, subj)
+            touch_user(message.from_user, task_type="photo")
+            clear_last_message(user_id)
+        else:
+            # Обычное решение
+            answer = await solve_image(compressed, caption, subj)
+            touch_user(message.from_user, task_type="photo")
+            # Сохраняем фото — вдруг следующим будет текст-контекст
+            save_last_message(
+                user_id, "photo",
+                bytes=compressed,
+                caption=caption,
+                subject=subj,
             )
 
-        answer = await solve_image(compressed, caption, subj)
-        touch_user(message.from_user, task_type="photo")
-        # Сбрасываем контекст после решения
-        clear_context(message.from_user.id)
     except Exception as e:
         log.error("Ошибка обработки фото: %s", e)
         traceback.print_exc()
@@ -1417,17 +1429,40 @@ async def handle_photo(message: types.Message):
     await send_long(message, answer)
 
 
-# ============ ТЕКСТ (с контекстом) ============
+# ============ ТЕКСТ ============
 @dp.message(F.text)
 async def handle_text(message: types.Message):
-    subj = user_subject.get(message.from_user.id, "general")
+    user_id = message.from_user.id
+    subj = user_subject.get(user_id, "general")
 
+    # Проверяем, есть ли предыдущее фото и похож ли текст на КОНТЕКСТ к нему
+    prev = get_last_message(user_id)
+    if prev and prev["type"] == "photo" and looks_like_context(message.text):
+        log.info("Текст похож на контекст к предыдущему фото — перерешиваю фото")
+        combined_caption = (
+            f"КОНТЕКСТ (используй при решении, это важно):\n"
+            f"{message.text}\n\n"
+            f"---\n"
+            f"ЗАДАНИЕ (на фото): {prev.get('caption') or 'Реши задание с картинки, опираясь на контекст выше.'}"
+        )
+        await bot.send_chat_action(message.chat.id, "typing")
+        try:
+            answer = await solve_image(prev["bytes"], combined_caption, prev["subject"])
+            touch_user(message.from_user, task_type="photo")
+            clear_last_message(user_id)
+        except Exception as e:
+            log.error("Ошибка перерешивания фото: %s", e)
+            traceback.print_exc()
+            await message.answer(f"Ошибка: {e}")
+            return
+        await send_long(message, answer)
+        return
+
+    # Стандартная проверка — задание?
     if not looks_like_task(message.text):
         log.info("handle_text: не похоже на задание: %r", message.text[:60])
-        # Сохраняем длинный текст в контекст — вероятно, это текст для следующего фото
-        if len(message.text) >= 80:
-            add_to_context(message.from_user.id, message.text, "text")
-            log.info("handle_text: длинный текст сохранён в контекст")
+        # Сохраняем как контекст на будущее
+        save_last_message(user_id, "text", text=message.text)
         await message.answer(
             "🤔 Это не похоже на школьное задание.\n\n"
             "Пришли текст задачи, пример или упражнения — я решу.\n\n"
@@ -1436,23 +1471,21 @@ async def handle_text(message: types.Message):
             "• «Что такое фотосинтез?»\n"
             "• «Переведи how are you»\n"
             "• «Вставь пропущенные буквы: к_рова, м_локо»\n\n"
-            "💡 Если это текст-контекст — можешь теперь отправить фото задания, "
-            "и я решу его с учётом этого текста."
+            "💡 Если это текст-контекст для следующего фото — просто отправь фото, "
+            "я решу его с учётом текста."
         )
         return
 
-    # Это задание. Если есть контекст — добавляем
-    ctx = get_context(message.from_user.id)
+    # Это задача. Если есть предыдущий текст — используем как контекст
     full_question = message.text
-    if ctx:
-        log.info("К тексту добавлен контекст (%d символов)", len(ctx))
-        full_question = ctx + "\n\n--- ТЕКУЩЕЕ ЗАДАНИЕ ---\n" + message.text
+    if prev and prev["type"] == "text":
+        full_question = prev["text"] + "\n\n---\n" + message.text
+        clear_last_message(user_id)
 
     await bot.send_chat_action(message.chat.id, "typing")
     try:
         answer = await solve_text(full_question, subj)
         touch_user(message.from_user, task_type="text")
-        clear_context(message.from_user.id)
     except Exception as e:
         log.error("Ошибка обработки текста: %s", e)
         traceback.print_exc()
