@@ -204,6 +204,15 @@ def get_subscription_status(user_id: int):
     return ("active", expire_dt, (expire_dt - now).days)
 
 
+def get_user_stars_paid(user_id: int) -> int:
+    """Сколько всего звёзд заплатил пользователь."""
+    total = 0
+    for p in payments.values():
+        if p.get("user_id") == user_id and p.get("status") == "paid":
+            total += p.get("amount", 0)
+    return total
+
+
 # ============ СОСТОЯНИЯ АДМИНА ============
 admin_states: dict = {}
 
@@ -473,15 +482,19 @@ async def cmd_subject(message: types.Message):
 @dp.message(Command("mysub"))
 async def cmd_mysub(message: types.Message):
     status, expire_dt, days_left = get_subscription_status(message.from_user.id)
+    stars_paid = get_user_stars_paid(message.from_user.id)
+
     if status == "active":
         await message.answer(
             f"💳 Ваша подписка активна.\n"
             f"📅 Действует до: {expire_dt.strftime('%d.%m.%Y %H:%M')}\n"
-            f"⏰ Осталось: {days_left} дн."
+            f"⏰ Осталось: {days_left} дн.\n"
+            f"💰 Всего оплачено: {stars_paid} ⭐"
         )
     elif status == "expired":
         await message.answer(
             f"⌛ Ваша подписка истекла {expire_dt.strftime('%d.%m.%Y')}.\n"
+            f"💰 Всего оплачено: {stars_paid} ⭐\n\n"
             f"Продлить — {PRICE_STARS} ⭐.",
             reply_markup=buy_kb(),
         )
@@ -540,7 +553,6 @@ async def pre_checkout(query: PreCheckoutQuery):
     await query.answer(ok=True)
 
 
-# ============ УСПЕШНАЯ ОПЛАТА (ИСПРАВЛЕНО) ============
 @dp.message(F.successful_payment)
 async def successful_payment(message: types.Message):
     try:
@@ -548,7 +560,6 @@ async def successful_payment(message: types.Message):
         sp = message.successful_payment
         amount = sp.total_amount
 
-        # Для Stars — telegram_payment_charge_id, для обычных провайдеров — provider_charge_id
         charge_id = (
             getattr(sp, "telegram_payment_charge_id", None)
             or getattr(sp, "provider_charge_id", None)
@@ -572,12 +583,15 @@ async def successful_payment(message: types.Message):
         new_expire = extend_subscription(user.id)
         touch_user(user)
 
-        log.info("!!! Подписка юзера %s до %s", user.id, new_expire)
+        total_paid = get_user_stars_paid(user.id)
+        log.info("!!! Подписка юзера %s до %s. Всего оплачено: %s ⭐",
+                 user.id, new_expire, total_paid)
 
         await message.answer(
             f"✅ Оплата получена! Подписка активна.\n\n"
             f"📅 Действует до: {new_expire.strftime('%d.%m.%Y %H:%M')}\n"
-            f"⏰ Это {SUBSCRIPTION_DAYS} дней доступа.\n\n"
+            f"⏰ Это {SUBSCRIPTION_DAYS} дней доступа.\n"
+            f"💰 Оплачено: {amount} ⭐ (всего: {total_paid} ⭐)\n\n"
             f"Проверить статус — /mysub",
             reply_markup=subject_kb(),
         )
@@ -588,7 +602,8 @@ async def successful_payment(message: types.Message):
                 f"💰 Новая оплата звёздами!\n"
                 f"👤 {user.full_name} (@{user.username or '—'})\n"
                 f"🆔 {user.id}\n"
-                f"⭐ {amount} звёзд\n"
+                f"⭐ Оплачено: {amount} звёзд\n"
+                f"⭐ Всего от юзера: {total_paid} звёзд\n"
                 f"📅 Подписка до: {new_expire.strftime('%d.%m.%Y')}",
             )
         except Exception as e:
@@ -881,6 +896,16 @@ async def cb_admin(call: CallbackQuery):
         used_pwd = sum(1 for v in passwords.values() if v.get("used_by"))
         paid = [p for p in payments.values() if p.get("status") == "paid"]
         total_stars = sum(p.get("amount", 0) for p in paid)
+
+        # Топ плательщиков
+        stars_by_user = {}
+        for p in paid:
+            uid = p.get("user_id")
+            if uid is None:
+                continue
+            stars_by_user[uid] = stars_by_user.get(uid, 0) + p.get("amount", 0)
+        top_payers = sorted(stars_by_user.items(), key=lambda x: x[1], reverse=True)[:10]
+
         lines = [
             "📊 Статистика",
             "",
@@ -892,12 +917,20 @@ async def cb_admin(call: CallbackQuery):
             f"   📝 текстом: {total_texts}",
             f"   📷 фото: {total_photos}",
             "",
-            "📋 Топ-10:",
+            "💰 Топ-10 по оплате:",
         ]
+        for i, (uid, stars) in enumerate(top_payers, 1):
+            s = stats.get(str(uid), {})
+            uname = s.get("username", "?")
+            lines.append(f"{i}. @{uname} (id {uid}): {stars} ⭐")
+
+        lines.append("")
+        lines.append("📋 Топ-10 по задачам:")
         sorted_users = sorted(stats.items(), key=lambda x: x[1].get("tasks", 0), reverse=True)[:10]
         for i, (uid, s) in enumerate(sorted_users, 1):
             uname = s.get("username", "?")
             lines.append(f"{i}. @{uname} (id {uid}): {s.get('tasks', 0)} задач")
+
         await call.message.answer("\n".join(lines))
         await call.answer()
 
@@ -914,16 +947,23 @@ async def cb_admin(call: CallbackQuery):
                 days = (exp_dt - now).days
                 s = stats.get(str(uid), {})
                 uname = s.get("username", "?")
-                items.append((exp_dt, uid, uname, days, "✅" if exp_dt > now else "⌛"))
+                stars = get_user_stars_paid(uid)
+                items.append((exp_dt, uid, uname, days, stars, "✅" if exp_dt > now else "⌛"))
             except Exception:
                 pass
         items.sort(reverse=True)
         lines = ["💳 Подписки:\n"]
-        for exp_dt, uid, uname, days, status in items[:30]:
+        for exp_dt, uid, uname, days, stars, status in items[:30]:
             if status == "✅":
-                lines.append(f"{status} @{uname} (id {uid}) — до {exp_dt.strftime('%d.%m.%Y')} ({days} дн.)")
+                lines.append(
+                    f"{status} @{uname} (id {uid}) — до {exp_dt.strftime('%d.%m.%Y')} "
+                    f"({days} дн.) · 💰 {stars} ⭐"
+                )
             else:
-                lines.append(f"{status} @{uname} (id {uid}) — истекла {exp_dt.strftime('%d.%m.%Y')}")
+                lines.append(
+                    f"{status} @{uname} (id {uid}) — истекла {exp_dt.strftime('%d.%m.%Y')} "
+                    f"· 💰 {stars} ⭐"
+                )
         text = "\n".join(lines)
         if len(text) > 4000:
             text = text[:4000] + "\n... (обрезано)"
@@ -952,7 +992,8 @@ async def cb_admin(call: CallbackQuery):
                 st = "👑"
             else:
                 st = "❌"
-            label = f"{st} @{uname} · {tasks} задач"
+            stars = get_user_stars_paid(uid_int)
+            label = f"{st} @{uname} · {tasks} задач · {stars} ⭐"
             rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"usr:info:{uid_int}")])
         rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:refresh")])
         await call.message.answer("👥 Пользователи:",
@@ -1020,10 +1061,17 @@ async def cb_user_action(call: CallbackQuery):
             status_txt = "❌ Нет подписки"
             exp_txt = "—"
 
+        stars_paid = get_user_stars_paid(uid)
+        pay_count = sum(
+            1 for p in payments.values()
+            if p.get("user_id") == uid and p.get("status") == "paid"
+        )
+
         text = (
             f"👤 Пользователь\n\n"
             f"ID: {uid}\nИмя: {full_name}\nUsername: @{uname}\n"
             f"Статус: {status_txt}\nПодписка до: {exp_txt}\nПароль: {pwd}\n\n"
+            f"💰 Оплачено: {stars_paid} ⭐ ({pay_count} раз)\n\n"
             f"📊 Задач: {tasks} (текст {texts}, фото {photos})\n"
             f"Первый раз: {first_seen}\nПоследний: {last_seen}"
         )
