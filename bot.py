@@ -461,8 +461,12 @@ SUBJECTS = [
 SUBJECT_NAMES = {code: name for name, code in SUBJECTS}
 SUBJECT_NAMES["general"] = "💬 Общее"
 
-MODE_PATTERN = re.compile(r"(режим|предмет|урок|класс|работа\w*|сто\w*|выбран|текущ)", re.IGNORECASE)
-
+MODE_PATTERN = re.compile(
+    r"\b(в каком режиме|какой режим|какой предмет|какой урок|какой класс|"
+    r"что за режим|сейчас режим|текущий режим|выбран режим|"
+    r"в каком я режиме|как ты работаешь|что ты умеешь)\b",
+    re.IGNORECASE,
+)
 
 def subject_kb():
     rows = []
