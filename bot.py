@@ -616,7 +616,8 @@ async def cmd_help(message: types.Message):
         "/mysub — статус подписки\n"
         "/buy — купить/продлить доступ\n"
         "/support — написать в поддержку\n"
-        "/reset — сбросить контекст диалога"
+        "/reset — сбросить контекст диалога\n"
+        "/close — сбросить тикет (только админ)"
     )
 
 
@@ -624,6 +625,32 @@ async def cmd_help(message: types.Message):
 async def cmd_reset(message: types.Message):
     clear_last_message(message.from_user.id)
     await message.answer("🧹 Контекст диалога сброшен.")
+
+
+@dp.message(Command("close"))
+async def cmd_close(message: types.Message):
+    """Закрывает все тикеты админа и сбрасывает состояние."""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Команда только для администратора.")
+        return
+
+    # Сбрасываем состояние ответа
+    admin_states.pop(ADMIN_ID, None)
+
+    # Закрываем все открытые тикеты админа
+    own_tickets = [
+        tid for tid, t in tickets.items()
+        if t["user_id"] == ADMIN_ID and t["status"] == "open"
+    ]
+    for tid in own_tickets:
+        tickets[tid]["status"] = "closed"
+    if own_tickets:
+        _save(TICKETS_FILE, tickets)
+
+    await message.answer(
+        f"🧹 Состояние сброшено. Закрыто твоих тикетов: {len(own_tickets)}.\n"
+        "Теперь можешь спокойно отправлять задачи."
+    )
 
 
 @dp.message(Command("subject"))
@@ -796,6 +823,13 @@ async def successful_payment(message: types.Message):
 
 @dp.message(Command("support"))
 async def cmd_support(message: types.Message):
+    if message.from_user.id == ADMIN_ID:
+        await message.answer(
+            "Ты админ — тебе поддержка не нужна.\n"
+            "Если случайно создал тикет — /close для сброса."
+        )
+        return
+
     open_ticket = get_open_ticket(message.from_user.id)
     if open_ticket:
         await message.answer(
@@ -816,6 +850,9 @@ async def cmd_support(message: types.Message):
 
 @dp.callback_query(F.data == "support_start")
 async def cb_support_start(call: CallbackQuery):
+    if call.from_user.id == ADMIN_ID:
+        await call.answer("Ты админ — поддержка не нужна. /close для сброса", show_alert=True)
+        return
     open_ticket = get_open_ticket(call.from_user.id)
     if open_ticket:
         await call.message.answer(
@@ -935,7 +972,10 @@ async def cb_ticket(call: CallbackQuery):
         return
     if action == "reply":
         admin_states[ADMIN_ID] = f"reply_ticket:{tid}"
-        await call.message.answer(f"✏️ Напиши ответ для тикета {tid}:")
+        await call.message.answer(
+            f"✏️ Напиши ответ для тикета {tid}:\n"
+            f"(для отмены — /close)"
+        )
         await call.answer()
     elif action == "close":
         tickets[tid]["status"] = "closed"
@@ -949,15 +989,18 @@ async def cb_ticket(call: CallbackQuery):
         await call.answer("Закрыт")
 
 
+# ВАЖНО: игнорируем команды с "/" — они пойдут в свои обработчики
 @dp.message(lambda m: m.from_user.id == ADMIN_ID
-            and admin_states.get(ADMIN_ID, "").startswith("reply_ticket:"))
+            and admin_states.get(ADMIN_ID, "").startswith("reply_ticket:")
+            and not (m.text or "").startswith("/")
+            and (m.text or m.caption))
 async def handle_admin_ticket_reply(message: types.Message):
     state = admin_states.pop(ADMIN_ID, "")
     _, tid = state.split(":", 1)
     if tid not in tickets:
         await message.answer("Тикет не найден.")
         return
-    reply_text = message.text or "[пусто]"
+    reply_text = message.text or message.caption or "[медиа]"
     tickets[tid]["messages"].append({
         "from": "admin", "text": reply_text,
         "time": datetime.now().isoformat(timespec="seconds"),
@@ -973,7 +1016,8 @@ async def handle_admin_ticket_reply(message: types.Message):
 
 @dp.message(lambda m: m.from_user.id == ADMIN_ID
             and admin_states.get(ADMIN_ID) == "awaiting_password_to_delete"
-            and m.text)
+            and m.text
+            and not m.text.startswith("/"))
 async def handle_admin_delete_password(message: types.Message):
     admin_states.pop(ADMIN_ID, None)
     value = (message.text or "").strip().upper()
@@ -1086,7 +1130,7 @@ async def cb_admin(call: CallbackQuery):
 
     elif action == "del_one":
         admin_states[ADMIN_ID] = "awaiting_password_to_delete"
-        await call.message.answer("Отправь пароль для удаления:")
+        await call.message.answer("Отправь пароль для удаления (для отмены — /close):")
         await call.answer()
 
     elif action == "del_free":
@@ -1404,10 +1448,6 @@ async def handle_mode_question(message: types.Message):
 
 # ============ ХЕЛПЕР: редактирование или отправка длинного текста ============
 async def edit_or_send_long(status_msg: types.Message, text: str):
-    """
-    Редактирует сообщение-статус в готовый ответ.
-    Если ответ длинный — редактирует первое, остальное досылает.
-    """
     limit = 4000
     if not text:
         text = "(пустой ответ)"
@@ -1425,7 +1465,6 @@ async def edit_or_send_long(status_msg: types.Message, text: str):
             await status_msg.answer(text)
             return
 
-    # Длинный ответ
     first = text[:limit]
     rest = text[limit:]
     try:
