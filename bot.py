@@ -294,28 +294,22 @@ NON_SCHOOL_WORDS = re.compile(
 
 
 def looks_like_task(text: str) -> bool:
-    """Пропускает только школьные задания."""
     if not text:
         return False
     t = text.strip()
 
-    # Явно НЕ школьная тема — сразу блок
     if NON_SCHOOL_WORDS.search(t):
         return False
 
-    # Школьные ключевые слова — пропускаем
     if SCHOOL_WORDS.search(t):
         return True
 
-    # Математические символы + цифры — задание
     if re.search(r"\d", t) and any(s in t for s in "=+-*/^√"):
         return True
 
-    # Подчёркивания (пропущенные буквы) — задание
     if "_" in t and len(t) >= 10:
         return True
 
-    # Длинный текст (≥ 80 символов) без запретных слов — вероятно задача
     if len(t) >= 80 and " " in t:
         return True
 
@@ -323,7 +317,6 @@ def looks_like_task(text: str) -> bool:
 
 
 def looks_like_context(text: str) -> bool:
-    """Текст-контекст для задачи (длинный, без глаголов-заданий)."""
     if not text:
         return False
     t = text.strip()
@@ -332,7 +325,6 @@ def looks_like_context(text: str) -> bool:
     if NON_SCHOOL_WORDS.search(t):
         return False
     if SCHOOL_WORDS.search(t):
-        # Если есть глаголы-задания — это не контекст, а задание
         if re.search(r"(реши|найди|выбери|вставь|ответь|перевед|что такое|вычисли)", t, re.IGNORECASE):
             return False
     return True
@@ -467,6 +459,7 @@ MODE_PATTERN = re.compile(
     r"в каком я режиме|как ты работаешь|что ты умеешь)\b",
     re.IGNORECASE,
 )
+
 
 def subject_kb():
     rows = []
@@ -1409,13 +1402,55 @@ async def handle_mode_question(message: types.Message):
     )
 
 
+# ============ ХЕЛПЕР: редактирование или отправка длинного текста ============
+async def edit_or_send_long(status_msg: types.Message, text: str):
+    """
+    Редактирует сообщение-статус в готовый ответ.
+    Если ответ длинный — редактирует первое, остальное досылает.
+    """
+    limit = 4000
+    if not text:
+        text = "(пустой ответ)"
+
+    if len(text) <= limit:
+        try:
+            await status_msg.edit_text(text)
+            return
+        except Exception as e:
+            log.warning("edit_text не сработал: %s. Удаляю и шлю новым.", e)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            await status_msg.answer(text)
+            return
+
+    # Длинный ответ
+    first = text[:limit]
+    rest = text[limit:]
+    try:
+        await status_msg.edit_text(first)
+    except Exception as e:
+        log.warning("edit_text (длинный) не сработал: %s", e)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        first_msg = await status_msg.answer(first)
+        for i in range(0, len(rest), limit):
+            await first_msg.answer(rest[i:i + limit])
+        return
+    for i in range(0, len(rest), limit):
+        await status_msg.answer(rest[i:i + limit])
+
+
 # ============ ФОТО ============
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
     user_id = message.from_user.id
     subj = user_subject.get(user_id, "general")
     mode_name = SUBJECT_NAMES.get(subj, subj)
-    await message.answer(f"Решаю... (режим: {mode_name})")
+    status_msg = await message.answer(f"Решаю... (режим: {mode_name})")
 
     try:
         photo = message.photo[-1]
@@ -1438,7 +1473,6 @@ async def handle_photo(message: types.Message):
 
         caption = message.caption or ""
 
-        # Проверяем, есть ли предыдущее сообщение-текст (контекст)
         prev = get_last_message(user_id)
         if prev and prev["type"] == "text":
             log.info("Найден контекст (текст) — использую его для фото")
@@ -1452,10 +1486,8 @@ async def handle_photo(message: types.Message):
             touch_user(message.from_user, task_type="photo")
             clear_last_message(user_id)
         else:
-            # Обычное решение
             answer = await solve_image(compressed, caption, subj)
             touch_user(message.from_user, task_type="photo")
-            # Сохраняем фото — вдруг следующим будет текст-контекст
             save_last_message(
                 user_id, "photo",
                 bytes=compressed,
@@ -1466,9 +1498,13 @@ async def handle_photo(message: types.Message):
     except Exception as e:
         log.error("Ошибка обработки фото: %s", e)
         traceback.print_exc()
-        await message.answer(f"Ошибка: {e}")
+        try:
+            await status_msg.edit_text(f"❌ Ошибка: {e}")
+        except Exception:
+            await message.answer(f"❌ Ошибка: {e}")
         return
-    await send_long(message, answer)
+
+    await edit_or_send_long(status_msg, answer)
 
 
 # ============ ТЕКСТ ============
@@ -1477,17 +1513,17 @@ async def handle_text(message: types.Message):
     user_id = message.from_user.id
     subj = user_subject.get(user_id, "general")
 
-    # Проверяем, есть ли предыдущее фото и похож ли текст на КОНТЕКСТ к нему
+    # Контекст к предыдущему фото
     prev = get_last_message(user_id)
     if prev and prev["type"] == "photo" and looks_like_context(message.text):
-        log.info("Текст похож на контекст к предыдущему фото — перерешиваю фото")
+        log.info("Текст похож на контекст к фото — перерешиваю фото")
+        status_msg = await message.answer("Решаю... (перерешиваю фото)")
         combined_caption = (
             f"КОНТЕКСТ (используй при решении, это важно):\n"
             f"{message.text}\n\n"
             f"---\n"
             f"ЗАДАНИЕ (на фото): {prev.get('caption') or 'Реши задание с картинки, опираясь на контекст выше.'}"
         )
-        await bot.send_chat_action(message.chat.id, "typing")
         try:
             answer = await solve_image(prev["bytes"], combined_caption, prev["subject"])
             touch_user(message.from_user, task_type="photo")
@@ -1495,9 +1531,12 @@ async def handle_text(message: types.Message):
         except Exception as e:
             log.error("Ошибка перерешивания фото: %s", e)
             traceback.print_exc()
-            await message.answer(f"Ошибка: {e}")
+            try:
+                await status_msg.edit_text(f"❌ Ошибка: {e}")
+            except Exception:
+                await message.answer(f"❌ Ошибка: {e}")
             return
-        await send_long(message, answer)
+        await edit_or_send_long(status_msg, answer)
         return
 
     # Проверка — школьное задание?
@@ -1519,27 +1558,25 @@ async def handle_text(message: types.Message):
         )
         return
 
-    # Это задание. Если есть предыдущий текст — используем как контекст
+    # Это задание
     full_question = message.text
     if prev and prev["type"] == "text":
         full_question = prev["text"] + "\n\n---\n" + message.text
         clear_last_message(user_id)
 
-    await bot.send_chat_action(message.chat.id, "typing")
+    status_msg = await message.answer("Решаю...")
     try:
         answer = await solve_text(full_question, subj)
         touch_user(message.from_user, task_type="text")
     except Exception as e:
         log.error("Ошибка обработки текста: %s", e)
         traceback.print_exc()
-        await message.answer(f"Ошибка: {e}")
+        try:
+            await status_msg.edit_text(f"❌ Ошибка: {e}")
+        except Exception:
+            await message.answer(f"❌ Ошибка: {e}")
         return
-    await send_long(message, answer)
-
-
-async def send_long(message: types.Message, text: str):
-    for i in range(0, len(text), 4000):
-        await message.answer(text[i:i + 4000])
+    await edit_or_send_long(status_msg, answer)
 
 
 async def main():
